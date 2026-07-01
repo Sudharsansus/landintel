@@ -60,6 +60,11 @@ def umeyama(
     if weights is None:
         weights = np.ones(n)
 
+    # Degenerate-input guard: fewer than 2 points give no defined similarity transform.
+    # Return an explicit degenerate result so callers reject cleanly (see below).
+    if n < 2:
+        return np.eye(2), 0.0, np.zeros(2), np.full(n, float("inf"))
+
     # Weighted centroids
     w_sum = weights.sum()
     src_centroid = (weights[:, None] * src).sum(axis=0) / w_sum
@@ -68,6 +73,16 @@ def umeyama(
     # Center the points
     src_c = src - src_centroid
     dst_c = dst - dst_centroid
+
+    # Zero-variance guard: all source points coincide after de-meaning, so the scale
+    # denominator (src_var) below is 0 -- the division would emit a RuntimeWarning and
+    # propagate NaN into s / t / residuals. Every caller already rejects a NaN/0 scale via
+    # the 0.5 < s < 2.0 band, but the warning clutters logs and NaN residuals are a smell.
+    # Return an explicit degenerate result (R=I, s=0, t=0, residuals=+inf) so callers that
+    # gate on a finite residual also reject cleanly, with no log noise.
+    src_var = (weights[:, None] * src_c ** 2).sum()
+    if not np.isfinite(src_var) or src_var < 1e-9:
+        return np.eye(2), 0.0, np.zeros(2), np.full(n, float("inf"))
 
     # Weighted covariance
     H = (src_c * weights[:, None]).T @ dst_c  # (2, 2)
@@ -80,8 +95,7 @@ def umeyama(
     sign_matrix = np.diag([1.0, np.sign(d)])
     R = Vt.T @ sign_matrix @ U.T
 
-    # Compute scale
-    src_var = (weights[:, None] * src_c ** 2).sum()
+    # Compute scale (src_var computed in the zero-variance guard above)
     s = np.trace(np.diag(S) @ sign_matrix) / src_var
 
     # Translation

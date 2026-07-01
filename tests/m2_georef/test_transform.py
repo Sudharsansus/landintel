@@ -110,3 +110,35 @@ def test_cadastral_adjust_distributes_discrepancy():
     # Field weight dominates: stones stay within a few cm of surveyor positions.
     for m1_idx, surv_idx in matched_pairs:
         assert np.linalg.norm(adjusted[m1_idx] - surveyor[surv_idx]) < 0.1
+
+
+def test_umeyama_degenerate_input_returns_clean_failure():
+    """All-equal source points (or a single point, n<2) must NOT emit a RuntimeWarning or
+    propagate NaN. The degenerate result (s=0, t=0, residuals=+inf) lets every downstream
+    caller reject with a clean 'no fit' via the existing 0.5 < s < 2.0 / finite-residual gates."""
+    import warnings
+
+    # 1) all-equal source points -- zero variance, previously RuntimeWarning + NaN
+    src = np.array([[5.0, 5.0], [5.0, 5.0], [5.0, 5.0]])
+    dst = np.array([[100.0, 100.0], [110.0, 100.0], [110.0, 110.0]])
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        R, s, t, r = umeyama(src, dst)
+    assert not caught, f"RuntimeWarning emitted: {[str(x.message) for x in caught]}"
+    assert s == 0.0
+    assert np.all(np.isfinite(t))
+    assert np.all(np.isinf(r))
+
+    # 2) n < 2 -- no defined transform; returns clean instead of a degenerate SVD
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        R, s, t, r = umeyama(np.array([[1.0, 1.0]]), np.array([[2.0, 2.0]]))
+    assert not caught
+    assert s == 0.0 and np.all(np.isfinite(t)) and np.all(np.isinf(r))
+
+    # 3) Real input still works (regression check)
+    src = np.array([[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]])
+    dst = np.array([[100.0, 100.0], [110.0, 100.0], [110.0, 110.0], [100.0, 110.0]])
+    R, s, t, r = umeyama(src, dst)
+    assert s == pytest.approx(1.0, abs=1e-9)
+    assert r.max() < 1e-9

@@ -162,6 +162,22 @@ def corroborate_seated(
 # 2. Propagation: place an un-seated FMB from a seated neighbour by shared edge.
 # ---------------------------------------------------------------------------
 
+def _point_seg_dist(px: float, py: float,
+                    ax: float, ay: float, bx: float, by: float) -> float:
+    """Minimum distance from point (px,py) to the segment (ax,ay)-(bx,by).
+
+    Used to match a neighbour label to the ring edge it lies on. A neighbour label
+    can sit anywhere ALONG the shared edge (often near a corner), so matching by the
+    edge MIDPOINT mis-picks a perpendicular edge whose midpoint happens to be nearer
+    the corner-positioned label; point-to-segment distance is the correct measure and
+    is always at least as accurate as midpoint distance."""
+    dx, dy = bx - ax, by - ay
+    if dx == 0.0 and dy == 0.0:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
 def _neighbor_edge(m1: M1PlotData, neighbor_survey: str) -> tuple[int, int, float] | None:
     """The ring edge of ``m1`` that borders ``neighbor_survey`` (from neighbour
     labels), as (corner_a, corner_b, length). None if no label names that survey.
@@ -180,9 +196,10 @@ def _neighbor_edge(m1: M1PlotData, neighbor_survey: str) -> tuple[int, int, floa
     best = None  # (dist, a, b)
     for a, b in edges:
         pa, pb = _rel_xy(m1, a), _rel_xy(m1, b)
-        mid = ((pa[0] + pb[0]) / 2.0, (pa[1] + pb[1]) / 2.0)
         for tx, ty in targets:
-            d = math.hypot(mid[0] - tx, mid[1] - ty)
+            # point-to-segment (not midpoint): a label near a corner of the shared edge
+            # must still match that edge, not a perpendicular edge with a nearer midpoint.
+            d = _point_seg_dist(tx, ty, pa[0], pa[1], pb[0], pb[1])
             if best is None or d < best[0]:
                 best = (d, a, b)
     if best is None:

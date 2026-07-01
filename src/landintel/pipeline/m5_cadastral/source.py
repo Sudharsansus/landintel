@@ -11,7 +11,8 @@ SOURCE-AGNOSTIC by design. A ``CadastralSource`` answers "give me the UTM polygo
 for survey number N (in village V)". Implementations:
   - ``VectorFileCadastralSource`` -- a file the client provides. Reads GeoJSON and
     KML/KMZ with the Python STANDARD LIBRARY only (json / zipfile / xml.etree), and
-    ESRI Shapefile if ``pyshp`` is installed. Reprojects to UTM 44N via pyproj.
+    ESRI Shapefile if ``pyshp`` is installed. Reprojects to the target UTM zone
+    (``TARGET_CRS``; default 43N / EPSG:32643 for west-TN like INGUR) via pyproj.
   - ``TngisCadastralSource`` -- the auto-fetch-by-village slot. INERT: the TN GIS
     server (ArcGIS at 117.239.110.245, proxied by tngis.tn.gov.in) exposes no
     reachable public vector endpoint (REST/WFS 404, the IP is firewalled, only
@@ -61,7 +62,7 @@ def _norm_survey(raw: str | None) -> str | None:
 
 @dataclass
 class CadastralParcel:
-    """One cadastral parcel polygon in UTM Zone 44N (EPSG:32644)."""
+    """One cadastral parcel polygon in the target UTM zone (default 43N / EPSG:32643)."""
     survey_number: str
     polygon: Polygon
     village: str | None = None
@@ -347,7 +348,8 @@ class VectorFileCadastralSource(CadastralSource):
     """Cadastral parcels loaded from a client-provided vector file.
 
     Supported: ``.geojson`` / ``.json``, ``.kml``, ``.kmz`` (stdlib only) and
-    ``.shp`` (needs pyshp). All geometry is reprojected to UTM Zone 44N.
+    ``.shp`` (needs pyshp). All geometry is reprojected to the target UTM zone
+    (``TARGET_CRS``; default 43N / EPSG:32643).
 
     survey_field / village_field : attribute names holding the survey number /
         village. Auto-detected from common aliases when omitted.

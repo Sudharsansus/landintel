@@ -174,16 +174,17 @@ def onnx_trt_available() -> bool:
 def _configure_trt() -> bool:
     """Enable TensorRT for the ONNX server-det/rec engines (batch throughput).
 
-    Gated by ``LANDINTEL_OCR_TRT`` (default "1" = use TRT when available; "0"
-    disables). When the TensorRT EP is present, onnxruntime already prefers it over
-    CUDA at session build, so this just (a) confirms availability and (b) sets the
-    engine cache + FP16 env the TRT EP reads, so the (slow) first-build engine plan
-    is cached on disk and reused across runs instead of recompiling every batch.
-    Returns True when TRT is configured. No-op + returns False otherwise, so the
-    CUDA path is unchanged on hosts without TensorRT (e.g. the dev box, where the
-    SM_120 note in project_gpu_ocr_setup applies).
+    Gated by ``LANDINTEL_OCR_TRT`` (default "0" = OFF; set "1" to opt in). DEFAULT OFF
+    because the TensorRT EP's first-build engine plan can hang/fail during PaddleOCR
+    construction on this SM_120 host, which silently drops the whole ONNX path to the
+    mobile-det CPU fallback (measured 2026-07-01). Plain CUDAExecutionProvider needs no
+    build step, loads in ~0.4 s, and runs the server-det at ~19 ms/inference on GPU -- so
+    TRT buys nothing here and only adds a failure surface. When enabled AND available, it
+    sets the engine cache + FP16 env so the (slow) first build is reused across runs.
+    Returns True when TRT is configured; no-op + False otherwise (the CUDA path is
+    unchanged).
     """
-    if os.environ.get("LANDINTEL_OCR_TRT", "1") == "0":
+    if os.environ.get("LANDINTEL_OCR_TRT", "0") == "0":
         return False
     if not onnx_trt_available():
         return False
@@ -196,6 +197,37 @@ def _configure_trt() -> bool:
     os.environ.setdefault("ORT_TENSORRT_FP16_ENABLE", "1")
     _log.info("TensorRT EP enabled for ONNX OCR (FP16, engine cache at %s)", cache)
     return True
+
+
+def _force_onnx_cuda_providers() -> None:
+    """Force PaddleX's ONNX Runtime runner onto CUDAExecutionProvider.
+
+    PaddleX derives the ONNX session's execution provider from ``device_type``, which it
+    resolves via ``parse_device`` -> ``paddle.device.is_compiled_with_cuda()``. The active
+    paddle here is a CPU build (there is no paddle-gpu wheel for Blackwell SM_120), so paddle
+    reports "no CUDA" and PaddleX silently downgrades the ONNX session to CPUExecutionProvider
+    -- even though onnxruntime-CUDA is fully working on this card (measured ~19 ms/inference,
+    GPU util 92%). onnxruntime's CUDA EP is INDEPENDENT of paddle's build, so we patch the
+    runner's provider default to CUDA (falling back to CPU) whenever onnxruntime-GPU is ready.
+    Idempotent; only touches the ONNX runner, never paddle's own device logic."""
+    try:
+        from paddlex.inference.models.runners.onnxruntime_runner import (  # noqa: PLC0415
+            ONNXRuntimeRunner,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("cannot patch ONNX runner providers (%s); ONNX may run on CPU", exc)
+        return
+    if getattr(ONNXRuntimeRunner, "_landintel_cuda_forced", False):
+        return
+
+    def _default_providers(self):  # noqa: ANN001, ANN202
+        device_id = self._config.get("device_id") or 0
+        return (["CUDAExecutionProvider", "CPUExecutionProvider"],
+                [{"device_id": device_id}, {}])
+
+    ONNXRuntimeRunner._default_providers = _default_providers
+    ONNXRuntimeRunner._landintel_cuda_forced = True
+    _log.info("Patched PaddleX ONNX runner -> CUDAExecutionProvider (bypasses paddle-CPU downgrade)")
 
 
 def _paddlex_model_dir(model_name: str) -> Path:
@@ -468,6 +500,7 @@ def _build_engine(det_model: str, rec_model: str, use_mkldnn: bool) -> Any:
                 if "onnxruntime" not in _ca.SUPPORTED_INFERENCE_ENGINE_LIST:
                     _ca.SUPPORTED_INFERENCE_ENGINE_LIST.append("onnxruntime")
                 _trt = _configure_trt()
+                _force_onnx_cuda_providers()   # bypass paddle-CPU's bogus gpu->cpu downgrade
                 _log.info("Using server_det via ONNX Runtime GPU (%s)",
                           "TensorRT+CUDA" if _trt else "CUDAExecutionProvider")
                 rec_dir = _paddlex_model_dir(rec_model)
@@ -522,6 +555,18 @@ def _build_engine(det_model: str, rec_model: str, use_mkldnn: bool) -> Any:
         device="cpu",
         enable_mkldnn=use_mkldnn,
     )
+
+
+def _body_ocr_engine(use_mkldnn: bool = False) -> Any:
+    """Engine for the BODY / header / glyph OCR passes. Prefers the server-det ONNX engine
+    on CUDA (GPU) so these passes -- the bulk of M1 OCR time -- run on the GPU instead of the
+    mobile CPU detector. ``_build_engine`` transparently falls back to mobile-det CPU when the
+    ONNX/GPU path is unavailable, so this is safe on CPU-only hosts. Historically these passes
+    were hard-pinned to DEFAULT_DET_MODEL (mobile CPU), which left the GPU idle even when
+    server_det was requested -- fixed 2026-07-01. Force mobile with LANDINTEL_BODY_GPU=0."""
+    if os.environ.get("LANDINTEL_BODY_GPU", "1") == "1":
+        return _build_engine(SERVER_DET_MODEL, DEFAULT_REC_MODEL, use_mkldnn)
+    return _build_engine(DEFAULT_DET_MODEL, DEFAULT_REC_MODEL, use_mkldnn)
 
 
 def _render_page(pdf_path: Path, page_number: int, zoom: float) -> np.ndarray:
@@ -1474,7 +1519,7 @@ def _extract_paddlevl(
     header_rgb = header_crop[:, :, ::-1].copy()  # BGR → RGB for PaddleOCR
     header_dets: list[OCRDetection] = []
     try:
-        paddle_engine = _build_engine(DEFAULT_DET_MODEL, DEFAULT_REC_MODEL, False)
+        paddle_engine = _body_ocr_engine(False)
         raw_header = paddle_engine.predict(header_rgb)
         header_dets = [
             d for d in _parse_result(raw_header, zoom)
@@ -1761,7 +1806,7 @@ def _extract_vision(
     header_rgb = bgr[:header_px, :, ::-1].copy()  # BGR → RGB
     header_dets: list[OCRDetection] = []
     try:
-        paddle_engine = _build_engine(DEFAULT_DET_MODEL, DEFAULT_REC_MODEL, False)
+        paddle_engine = _body_ocr_engine(False)
         raw_header = paddle_engine.predict(header_rgb)
         header_dets = [
             d for d in _parse_result(raw_header, zoom)
@@ -1928,7 +1973,7 @@ def _extract_multiangle(
     """
     import cv2  # noqa: PLC0415
 
-    engine = _build_engine(DEFAULT_DET_MODEL, DEFAULT_REC_MODEL, False)
+    engine = _body_ocr_engine(False)
 
     # Render full page once; all rotation ops work on this array.
     full_img = _render_page(pdf_path, page_number, zoom)  # RGB H×W×3
