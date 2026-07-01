@@ -39,6 +39,48 @@ binaries and `_dump/` are untracked (on disk, not in git).
 ---
 
 ## FIXED (2026-07-01 session)
+- **GPU OCR made to actually engage (Blackwell SM_120).** Root cause of "GPU idle / OCR on CPU":
+  (a) `LANDINTEL_OCR_TRT` defaulted ON, and the TensorRT first-build hangs -> the ONNX path
+  silently fell back to the mobile-det CPU engine; (b) PaddleX derives the ORT provider from
+  `paddle.is_compiled_with_cuda()`, which is False because the installed `paddlepaddle` (CPU 3.1.0)
+  wheel SHADOWS `paddlepaddle-gpu 3.3.1` (both write the same `paddle/` dir; CPU landed 5 min later
+  on 06-13) -> PaddleX downgraded the session to CPUExecutionProvider; (c) the glyph/body OCR passes
+  were HARD-PINNED to `DEFAULT_DET_MODEL` (mobile CPU), ignoring the server-det arg. Fixes in
+  `ocr.py`: TRT default OFF (opt-in), `_force_onnx_cuda_providers()` patches PaddleX's ORT runner
+  onto CUDAExecutionProvider (onnxruntime-CUDA is independent of paddle's build; proven 19 ms/inf,
+  92% util, 4.5 GB), `_body_ocr_engine()` routes body/glyph passes to the server-det ONNX-CUDA
+  engine (`LANDINTEL_BODY_GPU`, default on, safe mobile-CPU fallback). Result: warm ~2 s/plot glyph
+  vs 38 s CPU; ~80 s one-time cuDNN algo-search warm-up amortises across a serial batch (one warm
+  engine). Env/packages are fine (onnxruntime-gpu 1.26 + CUDA 12.8 driver) — the bug was pure
+  routing, NOT a reinstall.
+- **M1 re-scoped to MAX QUALITY (client: quality over speed, time irrelevant).** `run_m1.py` now
+  runs server-det GPU + vector-guided glyph pass + 6-angle multi-angle augment
+  (`LANDINTEL_OCR_MULTIANGLE_AUGMENT`) for maximum number recall. KEY FACT re-confirmed for the
+  client: STONES + LINES are VECTOR-derived (red fills / strokes), extracted independent of OCR —
+  genuinely 100% and engine-independent (proved: `extract_vectors` returns 30 stones for 1019 with
+  no OCR; == DXF). Only number LABELS are OCR-dependent; those are maximised then VISUALLY QA'd
+  (`run_m1_qa.py`), never claimed at a number that isn't real. Parallel-CPU speed path was built
+  then dropped once quality became the sole goal.
+- **umeyama degenerate-input guard** (`m2_georef/transform.py`): n<2 and zero-variance source
+  clouds returned NaN + a RuntimeWarning (scale divides by src_var=0). Now return an explicit
+  degenerate `(R=I, s=0, t=0, resid=+inf)`; every caller already rejects via the 0.5<s<2.0 /
+  finite-residual gates. + regression test. 153 tests green.
+- **Code-audit triaged (pasted 15-finding audit generated against a STALE tree).** Verified each
+  against real code: 3 STALE (duplicate `*_latest`/`*_extracted` dirs don't exist; verify.py UTM
+  box already zone-agnostic; double-cvtColor is intentional grayscaling). FIXED: Diamond 3 —
+  `_neighbor_edge` now matches by point-to-segment not edge-midpoint (SMOKE-TESTED as a real bug: a
+  corner-positioned label mis-picked a perpendicular edge) + test; Gold 7 — 3 misleading "UTM 44N"
+  docstrings corrected to 43N default; removed tracked `s3_tiles.py.orig` cruft. DEFERRED to the M2
+  run (need real propagation data): Diamond 2 (best-of-all-neighbors), Diamond 4 (range(4) cap).
+  Skipped: Silver 13 (norm_survey dedup — proven identical but adds coupling), Silver 14 (S->5/B->8
+  — INGUR surveys all-numeric, no benefit), Diamond 5 (3x DXF re-parse — perf only).
+- **Orchestration tool (Prefect) evaluated — HELD, not adopted.** Client sent two "ideas"; both
+  were the same tool (Prefect). Validated the pitch against code: every claimed pain point is
+  already solved (per-plot resilience in BOTH batch.py and club_pipeline; `_manifest.csv` state;
+  Celery workers exist; runners resumable). Prefect doesn't touch the real bottleneck (extraction
+  quality) and its OOM-"retry" idea is wrong (re-OOMs; the fix was the memory ceiling). Revisit
+  only at many-villages scale; if adopted then, task boundary = M1/M2/M3/edge_align/verify only,
+  never the inner math (umeyama/ICP/gates), SQLite-local (Apache-2.0, not MIT).
 - **M2 "diamonds" review — 1 adopted, 2 parked, 12 rejected.** Client sent a 15-tool catalog of
   niche algorithms and asked which actually improve ours. Judged against the REAL code, not the
   catalog's assumptions:
