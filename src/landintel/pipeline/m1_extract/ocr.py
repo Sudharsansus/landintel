@@ -1169,7 +1169,11 @@ def _build_paddlevl_engine() -> Any:
         use_chart_recognition=False,
         use_seal_recognition=False,
         use_ocr_for_image_block=True,
-        device="cpu",
+        # GPU now that paddle-gpu 3.3.1 (cu129) runs on Blackwell SM_120 -- verified with a
+        # real CUDA op + PaddleOCR-VL model load (~13 GB VRAM). Requires torch NOT be imported
+        # in-process (torch cu128 vs paddle cu129 CUDA-DLL conflict), so the Qwen/hf_vl path is
+        # mutually exclusive with paddlevl-on-GPU. Override with LANDINTEL_VL_DEVICE=cpu.
+        device=os.environ.get("LANDINTEL_VL_DEVICE", "gpu"),
     )
 
 
