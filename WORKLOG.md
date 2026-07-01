@@ -38,6 +38,27 @@ binaries and `_dump/` are untracked (on disk, not in git).
 
 ---
 
+## 2026-07-01 (overnight) — INGUR M1+M2 max-quality re-run, QA'd, M3 readiness
+- **M1 35/35 correct** (`output/INGUR/m1`): stone invariant PDF red-fill==DXF STONES **35/35 exact**,
+  closed 35/35, shapes match FMB 35/35 (visual montage), 34/35 PROPER. The one non-PROPER (**1027**)
+  is a SOURCE stated-area inconsistency (2.776 ha computed vs 0.79 ha header) — stones sit at the
+  boundary corners, so geometry is stone-confirmed; not a defect. Engine: server-det ONNX-CUDA +
+  6-angle augment. **PaddleOCR-VL** now installs+runs on GPU (paddle-gpu 3.3.1 on SM_120, torch
+  removed) but **hangs on body harvest** → not batch-viable; VL device default set to gpu but off the
+  M1 path.
+- **M2 34/34 clubbed, 0-FP** (`output/INGUR/m2`): 33 ACCEPT + 1 REVIEW (776 sliver); all 6 club-verify
+  gates PASS; coherent corridor in `clubbed_qa.png`. Accuracy **12.4 m median vs 522 surveyor stones =
+  cadastral ceiling** (M2 places onto cadastre perfectly; cadastre is ~12 m off truth).
+  `LANDINTEL_CAD_ROBUST_RESID=1` = exact no-op, left off.
+- **M3 readiness** (`output/INGUR/m3*`): m2_georef runs clean on fresh M1; **survey-grade where it
+  matches (field residual ~2 mm)**. OPEN: disposition ACCEPT 12→1 is **code-side** (old & fresh M1 give
+  identical ACCEPT=1) — the 2026-06-28 hardening tightened the ACCEPT gate (2 m field / self-calib
+  coverage / max-resid<3 m). First M3 task today: revisit ACCEPT recall-vs-0-FP policy.
+- Added QA tooling: `run_m1_numeric_qa.py`, `run_m2_qa.py`. Full suite **516 passed / 1 skipped**.
+  Committed+pushed 68386b3. See `MORNING_REPORT.md`.
+
+---
+
 ## FIXED (2026-07-01 session)
 - **GPU OCR made to actually engage (Blackwell SM_120).** Root cause of "GPU idle / OCR on CPU":
   (a) `LANDINTEL_OCR_TRT` defaulted ON, and the TensorRT first-build hangs -> the ONNX path
