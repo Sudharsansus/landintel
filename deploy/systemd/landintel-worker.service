@@ -1,0 +1,23 @@
+[Unit]
+Description=LandIntel Celery worker (via Docker Compose)
+Documentation=https://github.com/your-org/landintel
+After=landintel-api.service
+Requires=landintel-api.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/landintel
+
+ExecStart=docker compose up -d worker
+ExecStop=docker compose stop worker
+ExecReload=docker compose restart worker
+
+StandardOutput=journal
+StandardError=journal
+
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

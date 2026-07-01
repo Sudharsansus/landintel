@@ -1,0 +1,65 @@
+version: "3.9"
+
+# LandIntel — one-command local stack.
+# Bring up:  docker compose up -d
+# Tear down: docker compose down -v
+#
+# The api and worker images are built from the same Dockerfile; the worker
+# overrides CMD to run Celery instead of uvicorn.
+# Redis and Mongo are ephemeral in dev (no host-mounted volumes by default).
+
+services:
+  api:
+    build: .
+    image: landintel:latest
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      MONGO_URI: mongodb://mongo:27017
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    image: landintel:latest
+    command: >
+      celery -A landintel.workers.celery_app worker
+      --loglevel=info
+      --queues=jobs
+      --concurrency=2
+    env_file: .env
+    environment:
+      MONGO_URI: mongodb://mongo:27017
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      api:
+        condition: service_started
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mongo_data:

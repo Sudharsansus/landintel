@@ -1,0 +1,27 @@
+[Unit]
+Description=LandIntel API (FastAPI + uvicorn via Docker Compose)
+Documentation=https://github.com/your-org/landintel
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/landintel
+
+# Pull latest image before starting (comment out if deploying pre-built tags).
+ExecStartPre=docker compose pull api
+
+ExecStart=docker compose up -d api mongo redis
+ExecStop=docker compose stop api
+ExecReload=docker compose restart api
+
+# Log via journald -- view with: journalctl -u landintel-api -f
+StandardOutput=journal
+StandardError=journal
+
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

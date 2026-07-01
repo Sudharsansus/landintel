@@ -1,0 +1,43 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+node_modules/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+bin/oda_converter/*
+!bin/oda_converter/.gitkeep
+.claude/*.lock
+
+# --- project reorg 2026-07-01 ---
+# NB: gitignore does NOT support trailing inline comments -- a '#' after a pattern
+# becomes part of the pattern. Keep every comment on its own line.
+# archived outputs/scripts/binaries (kept on disk, not tracked)
+_dump/
+# fresh pipeline outputs (regenerable)
+output/
+# cadastre raster tile caches (big, regenerable)
+input/*/s3_tiles/
+input/*/tngis_cache*/
+*.whl
+*.zip
+*.rar
+*.log
+.tngis_cache*/
+# legacy output tree (pending move once AutoCAD releases lock)
+test2/
+# legacy reference (pending move)
+M2-ref/
+
+# Third-party reference CLONE -- carries its own embedded secrets (GCP service-account
+# key + auth token JSONs). Kept on disk for reference, NEVER tracked. Those keys must be
+# treated as compromised and REVOKED. Our own extracts (reference/*.py) stay tracked.
+reference/Sreeragu-FMBtoDXF-sreeragu-dev/
+# Defensive: never track credential blobs anywhere in the tree.
+**/serviceaccount.json
+**/*service-account*.json
+**/*-credentials.json

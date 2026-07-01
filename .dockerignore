@@ -1,0 +1,30 @@
+# Virtual environment — never send to Docker daemon (multiple GB)
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Local secrets — never bake into an image
+.env
+*.env.local
+
+# Test artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+
+# Frontend build artifacts (copied separately by CI at deploy time)
+frontend/node_modules/
+frontend/dist/
+
+# Git history (not needed in image)
+.git/

@@ -1,0 +1,246 @@
+# LandIntel — Render Blueprint
+# https://render.com/docs/blueprint-spec
+#
+# What this file deploys:
+#   landintel-mongo   Private svc  — MongoDB 7 self-hosted (Starter plan, 1 GB disk)
+#   landintel-redis   Redis        — Managed Redis (Starter plan)
+#   landintel-api     Web service  — FastAPI + uvicorn (Starter plan, 512 MB)
+#   landintel-worker  Worker       — Celery job processor (Standard plan, 2 GB)
+#
+# No external database accounts needed. Mongo and Redis both run inside this Blueprint.
+# Mongo is a private service — not reachable from the internet, only from api + worker.
+#
+# Before first deploy:
+#   1. Push this repo to GitHub / GitLab.
+#   2. In Render dashboard: New → Blueprint → connect the repo.
+#   3. Render reads this file and creates all four services.
+#   4. Set ONE secret in the dashboard env var panel: ANTHROPIC_API_KEY.
+#      Without it the app boots but the agent layer fails at runtime.
+#      AWS keys (S3_BUCKET etc.) are optional — only M4 delivery needs them.
+#      MONGO_URI and REDIS_URL auto-wire from the internal services.
+
+version: "1"
+
+services:
+
+  # ── MongoDB (self-hosted, private service) ──────────────────────────────────
+  # Render has no managed Mongo, so we run mongo:7 as a private service.
+  # Private services are reachable only from other services in this Blueprint.
+  # Internal hostname = service name: "landintel-mongo" on port 27017.
+  # The api and worker MONGO_URI env vars are wired to this host as a plain
+  # value (Render does not yet support fromService URI construction for pserv).
+  - type: pserv
+    name: landintel-mongo
+    env: image
+    image:
+      url: docker.io/library/mongo:7
+    plan: starter
+    # Persistent disk — Mongo requires durable storage across restarts.
+    # 1 GB is plenty for testing; bump to 10 GB before production load.
+    disk:
+      name: mongo-data
+      mountPath: /data/db
+      sizeGB: 1
+
+  # ── Managed Redis (Celery broker + result backend) ──────────────────────────
+  - type: redis
+    name: landintel-redis
+    # Starter plan is free and sufficient for the job queue volume at launch.
+    # Upgrade to Standard if queue depth or throughput grows.
+    plan: starter
+    ipAllowList: []  # internal only — only accessible by services in this Blueprint
+
+  # ── Frontend (React + Vite static site) ────────────────────────────────────
+  # Static sites are free on Render (no always-on container; CDN-delivered).
+  # SPA rewrite rule: any path that doesn't match a file serves /index.html,
+  # so refreshing on /jobs or /review doesn't 404.
+  - type: web
+    name: landintel-frontend
+    env: static
+    buildCommand: cd frontend && npm install && npm run build
+    staticPublishPath: frontend/dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: VITE_API_BASE_URL
+        value: https://landintel-api.onrender.com
+
+  # ── API (FastAPI + uvicorn) ─────────────────────────────────────────────────
+  - type: web
+    name: landintel-api
+    env: docker
+    dockerfilePath: ./Dockerfile
+    # Starter plan (512 MB) is enough for the API: it does no OCR and no model
+    # loading. All heavy work (PaddleOCR, agent calls) runs in the worker.
+    plan: starter
+    healthCheckPath: /health
+    # The FastAPI /health route returns {"status": "ok"} with no auth.
+    # Do NOT use /healthz — that only exists in nginx (deploy/nginx.conf),
+    # which is not used on Render. Render hits uvicorn directly.
+    envVars:
+      # ── Runtime mode ─────────────────────────────────────────────────────
+      - key: ENVIRONMENT
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      - key: CLIENT_ID
+        value: client_default
+        # Single-tenant for now; change when multi-tenancy is wired.
+
+      # ── CORS (browser cross-origin from the frontend) ─────────────────────
+      # Must match the frontend origin exactly — scheme, host, no trailing slash.
+      # Add extra origins comma-separated if you add a custom domain later.
+      - key: CORS_ALLOW_ORIGINS
+        value: https://landintel-frontend.onrender.com,http://localhost:5173,http://localhost:3000
+
+      # ── MongoDB (internal — landintel-mongo private service) ─────────────
+      # Points at the private Mongo service defined above.
+      # Render internal DNS: service name is the hostname within the Blueprint.
+      - key: MONGO_URI
+        value: mongodb://landintel-mongo:27017
+      - key: MONGO_DB
+        value: landintel
+
+      # ── Redis (wired from the managed Redis service above) ────────────────
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: landintel-redis
+          property: connectionString
+
+      # ── Anthropic (required — agent layer cannot run without it) ──────────
+      - key: ANTHROPIC_API_KEY
+        sync: false  # secret — set in dashboard, never commit to repo
+      - key: ANTHROPIC_MODEL
+        value: claude-opus-4-8
+
+      # ── AWS S3 (delivery package upload, M4) ─────────────────────────────
+      # Checked at use-time in storage/s3.py, not at startup. M1–M3 work
+      # without S3; only the final delivery step (M4 package) needs it.
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      - key: AWS_REGION
+        value: ap-south-1
+      - key: S3_BUCKET
+        sync: false
+
+      # ── OCR (PaddleOCR PP-OCRv5) ─────────────────────────────────────────
+      # Models are pre-downloaded into the image during docker build (see
+      # Dockerfile). They are baked into the image layers and available at
+      # runtime without any network call. Render allows outbound internet
+      # during builds, so the model download RUN step works correctly.
+      # Risk: if the build exceeds Render's 1-hour build timeout (unlikely
+      # for the ~600 MB paddle + model download, but possible on first build
+      # with a cold cache), the build fails. Re-trigger it — Render caches
+      # Docker layers so the second build is fast.
+      # ── OCR engine selection ─────────────────────────────────────────────
+      # Switch to "vision" once GOOGLE_CREDENTIALS_JSON is set in the dashboard.
+      # Falls back to PaddleOCR automatically if Vision credentials are missing.
+      - key: OCR_ENGINE
+        value: paddle
+      - key: GOOGLE_CREDENTIALS_JSON
+        sync: false  # service-account JSON content — set in dashboard, never commit
+
+      - key: OCR_DET_MODEL
+        value: PP-OCRv5_mobile_det
+      - key: OCR_REC_MODEL
+        value: en_PP-OCRv5_mobile_rec
+      - key: OCR_ZOOM
+        value: "3.0"
+      - key: OCR_USE_MKLDNN
+        value: "false"
+        # Leave false. Render's CPU infrastructure may not support oneDNN;
+        # enabling it risks a SIGILL crash on unsupported CPU features.
+
+      # ── ODA File Converter (M2, not yet shipped) ──────────────────────────
+      # M2 georef is not yet built. This path must point to the ODA binary
+      # inside the image. The binary is NOT redistributable and NOT in git;
+      # it must be placed at bin/oda_converter/ODAFileConverter before building.
+      # Until M2 ships, leaving this blank is fine — config.py checks it
+      # at use-time, not at startup, so the app boots without it.
+      - key: ODA_CONVERTER_PATH
+        value: /app/bin/oda_converter/ODAFileConverter
+
+      # ── GIS / coordinate systems (no API key, pyproj offline) ────────────
+      - key: GIS_SOURCE_CRS
+        value: EPSG:4326
+      - key: GIS_TARGET_CRS
+        value: EPSG:32644
+        # UTM Zone 44N — covers Tamil Nadu. Correct for this client.
+      - key: GIS_SNAP_TOLERANCE_M
+        value: "0.5"
+
+  # ── Celery worker ───────────────────────────────────────────────────────────
+  - type: worker
+    name: landintel-worker
+    env: docker
+    dockerfilePath: ./Dockerfile
+    # IMPORTANT: Standard plan (2 GB RAM) is the MINIMUM for this service.
+    # PaddleOCR loads its PP-OCRv5 models into memory (~400–600 MB) plus the
+    # paddle inference engine overhead. The free/starter plan (512 MB) will
+    # OOM-kill the process immediately when the first job triggers OCR.
+    # Use Standard (2 GB). If you see worker processes restarting with exit 137
+    # (SIGKILL), the OOM killer is hitting it — upgrade to Pro (4 GB).
+    plan: standard
+    dockerCommand: >-
+      celery -A landintel.workers.celery_app worker
+      --loglevel=info
+      --queues=jobs
+      --concurrency=1
+    # concurrency=1: one job at a time. PaddleOCR is not thread-safe and
+    # each worker loads the full model set. With 2 GB, running two concurrent
+    # workers risks OOM. Increase concurrency only after profiling real peak RSS.
+    envVars:
+      # Identical to the API env vars — Celery tasks instantiate the same
+      # Settings object, so every key must be present.
+      - key: ENVIRONMENT
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      - key: CLIENT_ID
+        value: client_default
+      - key: MONGO_URI
+        value: mongodb://landintel-mongo:27017
+      - key: MONGO_DB
+        value: landintel
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: landintel-redis
+          property: connectionString
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: ANTHROPIC_MODEL
+        value: claude-opus-4-8
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      - key: AWS_REGION
+        value: ap-south-1
+      - key: S3_BUCKET
+        sync: false
+      - key: OCR_ENGINE
+        value: paddle
+      - key: GOOGLE_CREDENTIALS_JSON
+        sync: false
+      - key: OCR_DET_MODEL
+        value: PP-OCRv5_mobile_det
+      - key: OCR_REC_MODEL
+        value: en_PP-OCRv5_mobile_rec
+      - key: OCR_ZOOM
+        value: "3.0"
+      - key: OCR_USE_MKLDNN
+        value: "false"
+      - key: ODA_CONVERTER_PATH
+        value: /app/bin/oda_converter/ODAFileConverter
+      - key: GIS_SOURCE_CRS
+        value: EPSG:4326
+      - key: GIS_TARGET_CRS
+        value: EPSG:32644
+      - key: GIS_SNAP_TOLERANCE_M
+        value: "0.5"

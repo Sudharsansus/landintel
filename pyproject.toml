@@ -1,0 +1,90 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "landintel"
+version = "0.1.0"
+description = "FMB land-survey PDFs to georeferenced DWG village maps, agentically automated."
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    # API + async DB
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "motor>=3.4",
+    # workers + broker
+    "celery>=5.4",
+    "redis>=5.0",
+    # storage
+    "boto3>=1.34",
+    # M1 extract
+    "pymupdf>=1.24",
+    "opencv-python>=4.10",
+    # paddle pinned exactly: the inference engine + OCR pair is version-fragile
+    # and must match what the Dockerfile builds.
+    # paddlepaddle>=3.1 required for fused_rms_norm_ext (PaddleOCR-VL-1.6 dependency).
+    "paddlepaddle==3.1.0",
+    "paddleocr==3.6.0",
+    # paddlex[ocr] provides the PaddleOCRVL pipeline used by OCR_ENGINE=paddlevl.
+    "paddlex[ocr]==3.6.1",
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "ezdxf>=1.3",
+    # M2 georef / M3 assemble
+    "pyproj>=3.6",
+    "shapely>=2.0",
+    # M4 report
+    "reportlab>=4.2",
+    "openpyxl>=3.1",
+    # visual QA overlay (m2_georef/qa_render.py) -- the human-auditable FP backstop
+    "matplotlib>=3.7",
+    # agent
+    "anthropic>=0.34",
+    # OCR — optional Vision engine; installed always so the image is self-contained
+    "google-cloud-vision>=3.7",
+    # direct HTTP use: the Google Vision REST fallback path in m1_extract/ocr.py
+    # (also a transitive dep of boto3/anthropic/google-cloud-vision, declared here
+    # because we import it directly).
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "mongomock-motor>=0.0.21",
+    "moto[s3]>=5.0",
+    "pypdf>=4.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+# GPU OCR: the server-det / TensorRT ONNX path in m1_extract/ocr.py (server_det via
+# ONNX Runtime on CUDA; LANDINTEL_OCR_TRT enables the TensorRT EP). Optional because
+# onnxruntime-gpu is heavy + platform-specific; the import is guarded so the core
+# install runs CPU/mobile-det without it. Install with: pip install ".[gpu]".
+gpu = [
+    "onnxruntime-gpu>=1.18",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ANN"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+mypy_path = "src"
