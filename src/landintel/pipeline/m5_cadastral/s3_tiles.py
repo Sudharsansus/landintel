@@ -38,15 +38,32 @@ from .source import CadastralParcel, CadastralSource, _norm_survey
 
 _log = logging.getLogger(__name__)
 
-S3_BASE = "https://s3.ap-south-2.amazonaws.com/prod-assets.mypropertyqr.in/village_border/"
+import os as _os
+
+# Tile variant. The mypropertyqr S3 serves TWO cadastral tilesets at z18:
+#   * survey_border (DEFAULT): the SURVEY-parcel layer -- clean GREEN parcel outlines on a
+#     WHITE background with ONE dark-purple SURVEY NUMBER per parcel. No subdivision clutter,
+#     so parcels vectorise cleanly and each number OCRs in one pass (dark-on-white). This is
+#     the reference server's source and the right input for M2.
+#   * village_border: the older layer -- green survey lines PLUS magenta SUBDIVISION lines and
+#     subdivision numbers (2A/2B/3C...) on a BLACK background. The subdivision ink fragments
+#     parcels and pollutes the label OCR. Kept selectable for back-compat / comparison.
+# Override with LANDINTEL_TILE_VARIANT=village_border if ever needed.
+TILE_VARIANT = _os.environ.get("LANDINTEL_TILE_VARIANT", "survey_border")
+S3_BASE = f"https://s3.ap-south-2.amazonaws.com/prod-assets.mypropertyqr.in/{TILE_VARIANT}/"
 TILE = 256
 ZOOM = 18
 
-# Orange/red survey-label HSV ranges (two bands around the hue wheel's red end).
-_ORANGE = [(np.array([0, 60, 90]), np.array([35, 255, 255])),
-           (np.array([150, 60, 90]), np.array([180, 255, 255]))]
-# Yellow boundary-line HSV range.
-_YELLOW = (np.array([20, 80, 90]), np.array([45, 255, 255]))
+_SURVEY_BORDER = TILE_VARIANT == "survey_border"
+# Survey-NUMBER label ink. survey_border draws numbers in dark PURPLE (HSV hue ~137) on white;
+# village_border draws them in ORANGE/red (two bands at the red end) on black.
+if _SURVEY_BORDER:
+    _ORANGE = [(np.array([118, 60, 40]), np.array([158, 255, 215]))]     # dark-purple numbers
+else:
+    _ORANGE = [(np.array([0, 60, 90]), np.array([35, 255, 255])),
+               (np.array([150, 60, 90]), np.array([180, 255, 255]))]
+# Parcel-boundary line HSV range (yellow-green; hue ~36 on survey_border, ~30-45 on village).
+_YELLOW = (np.array([20, 80, 90]), np.array([48, 255, 255]))
 
 
 class TileGrid:
@@ -91,33 +108,67 @@ def download_tiles(
     tx0, tx1 = int(min(gxs) // TILE), int(max(gxs) // TILE)
     ty0, ty1 = int(min(gys) // TILE), int(max(gys) // TILE)
     out: dict[tuple[int, int], Path] = {}
-    n_dl = 0
+    todo: list[tuple[int, int, Path]] = []
     for tx in range(tx0, tx1 + 1):
         for ty in range(ty0, ty1 + 1):
             p = cache_dir / f"{tx}_{ty}.png"
-            if not p.exists():
-                try:
-                    req = urllib.request.Request(f"{S3_BASE}{tx}/{ty}.png",
-                                                 headers={"User-Agent": "curl/8"})
-                    data = urllib.request.urlopen(req, timeout=30).read()
-                    if len(data) < 800:        # blank/placeholder tile
-                        continue
-                    p.write_bytes(data)
-                    n_dl += 1
-                except Exception:              # noqa: BLE001 - 404 / network
-                    continue
             if p.exists():
                 out[(tx, ty)] = p
-    _log.info("S3 tiles: %d covering bbox (%d newly downloaded)", len(out), n_dl)
+            else:
+                todo.append((tx, ty, p))
+
+    def _fetch(job: tuple[int, int, Path]):
+        tx, ty, p = job
+        try:
+            req = urllib.request.Request(f"{S3_BASE}{tx}/{ty}.png",
+                                         headers={"User-Agent": "curl/8"})
+            data = urllib.request.urlopen(req, timeout=30).read()
+            if len(data) < 800:                # blank/placeholder tile
+                return None
+            p.write_bytes(data)
+            return (tx, ty, p)
+        except Exception:                      # noqa: BLE001 - 404 / network
+            return None
+
+    # PARALLEL fetch of the missing tiles: pure network I/O (urllib releases the GIL), so a
+    # thread pool turns a ~1300-tile wide-window harvest from minutes into seconds. Cached
+    # tiles never hit the net. Workers tunable via LANDINTEL_TILE_WORKERS.
+    n_dl = 0
+    if todo:
+        from concurrent.futures import ThreadPoolExecutor
+        workers = min(int(_os.environ.get("LANDINTEL_TILE_WORKERS", "32")), max(1, len(todo)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for res in pool.map(_fetch, todo):
+                if res is not None:
+                    out[(res[0], res[1])] = res[2]
+                    n_dl += 1
+    _log.info("S3 tiles: %d covering bbox (%d newly downloaded, %d workers)",
+              len(out), n_dl, min(32, len(todo)) if todo else 0)
     return out
 
 
 def _orange_mask(bgr: np.ndarray) -> np.ndarray:
+    """Binary mask of the survey-NUMBER label ink (purple on survey_border, orange on
+    village_border) -- used to LOCATE and isolate the digits for OCR."""
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     m = np.zeros(bgr.shape[:2], np.uint8)
     for lo, hi in _ORANGE:
         m = cv2.bitwise_or(m, cv2.inRange(hsv, lo, hi))
     return m
+
+
+def _ocr_prep(bgr: np.ndarray) -> np.ndarray:
+    """OCR-ready canvas: isolate the survey-NUMBER ink as clean DARK text on a WHITE ground.
+
+    Both tilesets carry other clutter (green parcel lines everywhere; on village_border also a
+    black background + magenta subdivision lines/labels). PaddleOCR reads dark-on-white digits
+    best, so blank EVERYTHING to white and paint only the number ink black. This replaces the
+    old 'boost labels to white' trick, which erased the numbers on survey_border's white
+    background. Returned as a 3-channel (grey) BGR image the detector expects."""
+    m = _orange_mask(bgr)
+    out = np.full_like(bgr, 255)
+    out[m > 0] = 0
+    return out
 
 
 def _fuzzy_survey_match(ocr_text: str, known_surveys: set[str]) -> str | None:
@@ -162,11 +213,9 @@ def ocr_locate_labels(
         img = cv2.imread(str(path))
         if img is None:
             continue
-        boost = img.copy()
-        boost[_orange_mask(img) > 0] = (255, 255, 255)
-        up = cv2.resize(boost, None, fx=upscale, fy=upscale, interpolation=cv2.INTER_CUBIC)
-        for r in engine.predict(cv2.cvtColor(cv2.cvtColor(up, cv2.COLOR_BGR2GRAY),
-                                             cv2.COLOR_GRAY2BGR)):
+        up = cv2.resize(_ocr_prep(img), None, fx=upscale, fy=upscale,
+                        interpolation=cv2.INTER_CUBIC)
+        for r in engine.predict(up):
             d = r if isinstance(r, dict) else r.json.get("res", r)
             texts = d.get("rec_texts", [])
             polys = d.get("rec_polys", d.get("dt_polys", []))
@@ -228,14 +277,9 @@ def ocr_second_pass(
         img = cv2.imread(str(path))
         if img is None:
             continue
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY, 11, 2)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE,
-                                  cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)))
-        binary[_orange_mask(img) > 0] = 255
-        up = cv2.resize(binary, None, fx=upscale, fy=upscale, interpolation=cv2.INTER_CUBIC)
-        for r in engine.predict(cv2.cvtColor(up, cv2.COLOR_GRAY2BGR)):
+        up = cv2.resize(_ocr_prep(img), None, fx=upscale, fy=upscale,
+                        interpolation=cv2.INTER_CUBIC)
+        for r in engine.predict(up):
             d = r if isinstance(r, dict) else r.json.get("res", r)
             texts = d.get("rec_texts", [])
             polys = d.get("rec_polys", d.get("dt_polys", []))
@@ -292,10 +336,9 @@ def ocr_multi_angle_pass(
         img = cv2.imread(str(path))
         if img is None:
             continue
-        boost = img.copy()
-        boost[_orange_mask(img) > 0] = (255, 255, 255)
-        up = cv2.resize(boost, None, fx=upscale, fy=upscale, interpolation=cv2.INTER_CUBIC)
-        gray = cv2.cvtColor(cv2.cvtColor(up, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
+        up = cv2.resize(_ocr_prep(img), None, fx=upscale, fy=upscale,
+                        interpolation=cv2.INTER_CUBIC)
+        gray = up
         H, W = gray.shape[:2]
         center = (W / 2.0, H / 2.0)
         for ang in angles:
@@ -413,9 +456,7 @@ def _stitch_modeA(tiles, tx, ty):
     canvas, ox, oy = _stitch_neighbourhood(tiles, tx, ty, rad=1)
     if canvas is None:
         return None, 0, 0
-    b = canvas.copy()
-    b[_orange_mask(canvas) > 0] = (255, 255, 255)
-    return cv2.cvtColor(cv2.cvtColor(b, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR), ox, oy
+    return _ocr_prep(canvas), ox, oy
 
 
 def _warm_modeB(img):
@@ -444,9 +485,7 @@ def _build_mosaics(work: dict[tuple[int, int], Path]):
         if im is not None:
             canvas[(ty - ty0) * TILE:(ty - ty0 + 1) * TILE,
                    (tx - tx0) * TILE:(tx - tx0 + 1) * TILE] = im
-    orange = canvas.copy()
-    orange[_orange_mask(canvas) > 0] = (255, 255, 255)
-    orangeA = cv2.cvtColor(cv2.cvtColor(orange, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
+    orangeA = _ocr_prep(canvas)
     warmB = cv2.cvtColor(255 - _warm_core_mask(canvas), cv2.COLOR_GRAY2BGR)
     return orangeA, warmB, tx0 * TILE, ty0 * TILE
 

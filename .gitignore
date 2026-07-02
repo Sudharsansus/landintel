@@ -41,3 +41,7 @@ reference/Sreeragu-FMBtoDXF-sreeragu-dev/
 **/serviceaccount.json
 **/*service-account*.json
 **/*-credentials.json
+
+# cadastral tile caches (variant-named) + pipeline outputs (regenerated)
+input/*/s3_*/
+output/
