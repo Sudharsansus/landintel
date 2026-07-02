@@ -64,7 +64,11 @@ print("[4/5] clubbing (cadastral seat @ TRUE scale + relative-club) -- NO survey
 results = club_pipeline(m1_paths, OUT, crs=CRS, cadastral_source=cad)
 
 print("[5/5] quality pass: edge-align + corner-snap (size-relative, 0-FP)...")
-snap = snap_and_rewrite(results, OUT, crs=CRS, enable=True, tol=5.0)   # NO truth_stones -> surveyor-free
+# tol=8: cadastral seating is ~12 m absolute, so the SAME physical stone lands 6-10 m
+# apart across neighbours; 5 m missed those clusters and left sliver gaps in QGIS.
+# Safe to widen: every snap is still 0-FP-guarded (centroid-move / area / overlap
+# caps in boundary_snap revert any unsafe plot).
+snap = snap_and_rewrite(results, OUT, crs=CRS, enable=True, tol=8.0)   # NO truth_stones -> surveyor-free
 print(f"      edge-align {snap.n_edge_constraints} constraints / {snap.n_edge_moved} moved; "
       f"corner-snap {snap.n_corners_snapped} corners")
 

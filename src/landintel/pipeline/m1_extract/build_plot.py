@@ -49,6 +49,15 @@ from .pdf_vectors import BOUNDARY_MIN_WIDTH, Marker, PageVectors, Segment
 
 __all__ = ["build_plot", "points_to_metres"]
 
+# Client standard: separation "whisker" lines (corner -> neighbour) are drawn at a
+# fixed 21 m length on every FMB, regardless of the arbitrary length in the source.
+SEPARATION_LEN_M = 21.0
+
+# A subdivision-line endpoint within this distance (m) of the boundary is treated as a
+# gap to close and snapped onto the boundary ring (client: "subdivision lines not
+# attached to boundary"). Small enough not to disturb genuine interior T-junctions.
+SUBDIV_SNAP_TOL_M = 3.0
+
 # Endpoint coincidence tolerance (PDF points) when chaining an open boundary.
 _CHAIN_TOLERANCE = 0.5
 
@@ -716,8 +725,30 @@ def build_plot(
         for m in anchored
     ]
 
+    # Boundary ring in real metres -- shared by the subdivision-attach snap AND the
+    # separation-whisker normalisation below.
+    _ring_m = [_transform(p, ppm, page_height) for p in ring_px] if len(ring_px) >= 2 else []
+    _bnd_ring_m = Polygon(_ring_m).exterior if len(_ring_m) >= 4 else None
+
+    def _snap_to_boundary(pt: Point) -> Point:
+        """Attach a subdivision endpoint to the boundary when it stops just short of it.
+        A subdivision line divides the parcel, so its ends lie ON the boundary; vector
+        extraction sometimes leaves a small gap (line not drawn quite to the edge). If an
+        endpoint is within SUBDIV_SNAP_TOL_M of the ring, snap it to the nearest ring
+        point. Genuinely-interior endpoints (T-junctions with other subdivisions, far from
+        the boundary) are beyond the tol and left untouched -- so this never distorts the
+        internal network, it only closes the boundary gap the client flagged."""
+        if _bnd_ring_m is None:
+            return pt
+        p = ShapelyPoint(pt[0], pt[1])
+        if _bnd_ring_m.distance(p) <= SUBDIV_SNAP_TOL_M:
+            proj = _bnd_ring_m.interpolate(_bnd_ring_m.project(p))
+            return (proj.x, proj.y)
+        return pt
+
     subdivision_segments = [
-        (_transform(s.start, ppm, page_height), _transform(s.end, ppm, page_height))
+        (_snap_to_boundary(_transform(s.start, ppm, page_height)),
+         _snap_to_boundary(_transform(s.end, ppm, page_height)))
         for s in vectors.internal
     ]
     # Chain/traverse: keep only segments INSIDE the plot boundary.  The traverse
@@ -739,8 +770,27 @@ def build_plot(
         for s in vectors.chain
         if _chain_inside(s)
     ]
+    # Separation "whisker" lines stick OUT from the plot's corner stones toward the
+    # neighbouring parcels; the length actually drawn is arbitrary (it runs to the
+    # neighbour or the sheet edge). Client standard: a FIXED 21 m whisker on every
+    # FMB. Keep each whisker's boundary-anchored end + its direction, and normalise
+    # the length to exactly SEPARATION_LEN_M.
+    def _norm_separation(a: Point, b: Point) -> tuple[Point, Point]:
+        if _bnd_ring_m is None:
+            return (a, b)
+        da = _bnd_ring_m.distance(ShapelyPoint(a[0], a[1]))
+        db = _bnd_ring_m.distance(ShapelyPoint(b[0], b[1]))
+        anchor, free = (a, b) if da <= db else (b, a)
+        dx, dy = free[0] - anchor[0], free[1] - anchor[1]
+        L = math.hypot(dx, dy)
+        if L < 1e-6:
+            return (a, b)
+        ux, uy = dx / L, dy / L
+        return (anchor, (anchor[0] + ux * SEPARATION_LEN_M, anchor[1] + uy * SEPARATION_LEN_M))
+
     separation_segments = [
-        (_transform(s.start, ppm, page_height), _transform(s.end, ppm, page_height))
+        _norm_separation(_transform(s.start, ppm, page_height),
+                         _transform(s.end, ppm, page_height))
         for s in vectors.separation
     ]
 

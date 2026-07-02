@@ -44,6 +44,11 @@ PROP_SCALE_HI = 1.18
 # Interior overlap (fraction of smaller footprint) above this = the two plots are
 # NOT tiling -> reject the propagated orientation.
 PROP_MAX_OVERLAP = 0.12
+# After the 2-point shared-edge alignment, any further B stone landing within this
+# distance (m) of an A stone is the SAME physical corner -> extra correspondence
+# for the >=3-point least-squares re-fit (client directive 2026-07-02: match a
+# minimum of 3 stone points per FMB wherever the data allows).
+PROP_REFIT_SNAP_M = 2.0
 
 _DIGITS = re.compile(r"(\d{1,5})")
 
@@ -302,13 +307,65 @@ def propagate_from_seated(
     ov_a, adjusted, R, s, t, poly = best
     if ov_a > PROP_MAX_OVERLAP:
         return None
+
+    def _passes_overlap_gates(candidate_poly) -> bool:
+        if a_footprint is not None and candidate_poly.intersects(a_footprint):
+            ov = candidate_poly.intersection(a_footprint).area / max(
+                min(candidate_poly.area, a_footprint.area), 1e-9)
+            if ov > PROP_MAX_OVERLAP:
+                return False
+        for fp in placed_footprints:
+            if fp is None or not candidate_poly.intersects(fp):
+                continue
+            ov = candidate_poly.intersection(fp).area / max(
+                min(candidate_poly.area, fp.area), 1e-9)
+            if ov > PROP_MAX_OVERLAP:
+                return False
+        return True
+
     # Reject overlap with ANY already-placed plot (global tiling).
-    for fp in placed_footprints:
-        if fp is None or not poly.intersects(fp):
+    if not _passes_overlap_gates(poly):
+        return None
+
+    # ---- >=3-point least-squares refinement (min 3 stone matches per FMB) ----
+    # The 2-point edge fit is EXACT on its two endpoints, so any endpoint error goes
+    # straight into the placement. Adjacent parcels share corners beyond the matched
+    # edge: after the initial alignment, every other B corner that lands on an A
+    # stone (within PROP_REFIT_SNAP_M) is the same physical corner -> an extra
+    # correspondence. With >=3 pairs the similarity is re-fit by least squares
+    # (errors average out). The re-fit must re-pass scale + tiling gates; otherwise
+    # the gated 2-point result stands (never lose a valid placement to refinement).
+    n_fit_pts = 2
+    a_stones = np.asarray(adj_a, float)
+    src_pairs = [Q1, Q2]
+    dst_pairs = [P1, P2]
+    used_b = {b_corner_a, b_corner_b}
+    used_a = {a_corner_a, a_corner_b}
+    for bi in m1_b.outer_stone_indices:
+        if bi in used_b or not (0 <= bi < len(adjusted)):
             continue
-        ov = poly.intersection(fp).area / max(min(poly.area, fp.area), 1e-9)
-        if ov > PROP_MAX_OVERLAP:
-            return None
+        d = np.hypot(a_stones[:, 0] - adjusted[bi][0],
+                     a_stones[:, 1] - adjusted[bi][1])
+        ai = int(np.argmin(d))
+        if float(d[ai]) <= PROP_REFIT_SNAP_M and ai not in used_a:
+            src_pairs.append(np.array(_rel_xy(m1_b, bi), float))
+            dst_pairs.append(np.array([a_stones[ai][0], a_stones[ai][1]], float))
+            used_b.add(bi)
+            used_a.add(ai)
+    if len(src_pairs) >= 3:
+        R2, s2, t2, _r2 = umeyama(np.array(src_pairs), np.array(dst_pairs))
+        if PROP_SCALE_LO <= s2 <= PROP_SCALE_HI:
+            adjusted2 = s2 * (all_b @ R2.T) + t2
+            ring2 = [i for i in m1_b.outer_stone_indices if 0 <= i < len(adjusted2)]
+            if len(ring2) >= 3:
+                poly2 = Polygon([(float(adjusted2[i][0]), float(adjusted2[i][1]))
+                                 for i in ring2])
+                if not poly2.is_valid:
+                    poly2 = poly2.buffer(0)
+                if (not poly2.is_empty and poly2.area > 0
+                        and _passes_overlap_gates(poly2)):
+                    adjusted, R, s, t, poly = adjusted2, R2, float(s2), t2, poly2
+                    n_fit_pts = len(src_pairs)
 
     return CandidatePlacement(
         method="propagated",
@@ -318,5 +375,6 @@ def propagate_from_seated(
         passes_gate=True,
         scale=s,
         note=f"propagated from seated {m1_a.survey_number} "
-             f"(shared edge {len_a:.1f}/{len_b:.1f} m, tile-overlap {ov_a:.0%})",
+             f"(shared edge {len_a:.1f}/{len_b:.1f} m, tile-overlap {ov_a:.0%}, "
+             f"{n_fit_pts}-pt fit)",
     )

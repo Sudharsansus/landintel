@@ -222,8 +222,20 @@ def _force_onnx_cuda_providers() -> None:
 
     def _default_providers(self):  # noqa: ANN001, ANN202
         device_id = self._config.get("device_id") or 0
+        # cudnn_conv_algo_search=HEURISTIC: skip cuDNN's EXHAUSTIVE per-input-shape
+        # convolution autotuning. The glyph pass feeds MANY differently-sized tiny
+        # canvases, so exhaustive search re-tunes on every new shape -> the first
+        # dense plot stalled ~110 s (later plots reuse the cache). HEURISTIC picks a
+        # good algo instantly with no measurable accuracy cost. arena config keeps
+        # the N-worker sessions from each grabbing the whole card.
+        cuda_opts = {
+            "device_id": device_id,
+            "cudnn_conv_algo_search": os.environ.get(
+                "LANDINTEL_CUDNN_ALGO", "HEURISTIC"),
+            "arena_extend_strategy": "kSameAsRequested",
+        }
         return (["CUDAExecutionProvider", "CPUExecutionProvider"],
-                [{"device_id": device_id}, {}])
+                [cuda_opts, {}])
 
     ONNXRuntimeRunner._default_providers = _default_providers
     ONNXRuntimeRunner._landintel_cuda_forced = True
@@ -632,25 +644,8 @@ def _ocr_canvas(img_gray: np.ndarray, engine: Any) -> tuple[str, float] | None:
     return (text, float(best_conf)) if text else None
 
 
-def _ocr_canvas_all(
-    img_gray: np.ndarray,
-    engine: Any,
-) -> list[tuple[str, float, tuple[float, float]]]:
-    """OCR a canvas; return ALL detected text regions as (text, conf, canvas_center).
-
-    Unlike _ocr_canvas which returns only the single best result, this captures
-    every text box detected by the engine.  Used for multi-measurement cluster
-    canvases where several adjacent fills from different measurements were grouped
-    together — the detection step finds each text region independently.
-    """
-    img_rgb = np.stack([img_gray, img_gray, img_gray], axis=-1)
-    try:
-        raw = engine.predict(img_rgb)
-    except Exception:  # noqa: BLE001
-        return []
-    if not raw:
-        return []
-    result = raw[0]
+def _result_to_all(result: Any, w: float, h: float) -> list[tuple[str, float, tuple[float, float]]]:
+    """Turn one PaddleOCR result dict into [(text, conf, (cx, cy)), ...]."""
     texts = result.get("rec_texts", [])
     scores = result.get("rec_scores", [])
     boxes = result.get("dt_polys", [])
@@ -664,9 +659,51 @@ def _ocr_canvas_all(
             cx = float(pts[:, 0].mean())
             cy = float(pts[:, 1].mean())
         else:
-            cx, cy = float(img_gray.shape[1]) / 2.0, float(img_gray.shape[0]) / 2.0
+            cx, cy = w / 2.0, h / 2.0
         out.append((text, float(score), (cx, cy)))
     return out
+
+
+def _ocr_canvas_all(
+    img_gray: np.ndarray,
+    engine: Any,
+) -> list[tuple[str, float, tuple[float, float]]]:
+    """OCR a canvas; return ALL detected text regions as (text, conf, canvas_center)."""
+    img_rgb = np.stack([img_gray, img_gray, img_gray], axis=-1)
+    try:
+        raw = engine.predict(img_rgb)
+    except Exception:  # noqa: BLE001
+        return []
+    if not raw:
+        return []
+    return _result_to_all(raw[0], float(img_gray.shape[1]), float(img_gray.shape[0]))
+
+
+def _ocr_canvases_batch(
+    canvases: list[np.ndarray],
+    engine: Any,
+) -> list[list[tuple[str, float, tuple[float, float]]]]:
+    """OCR MANY glyph canvases in ONE batched ``engine.predict([...])`` call.
+
+    This is the throughput lever for the per-glyph pass: instead of ~400 individual
+    predict() calls per page (2-8 per glyph, each paying full det+rec pipeline +
+    GPU-launch overhead -> ~110 s/plot), all canvases go through one call so PaddleX
+    batches the recognition crops (text_recognition_batch_size). Returns one result
+    list per input canvas, in the SAME order. Falls back to per-canvas on any error so
+    a single bad canvas cannot lose the whole batch.
+    """
+    if not canvases:
+        return []
+    rgbs = [np.stack([c, c, c], axis=-1) for c in canvases]
+    try:
+        raws = list(engine.predict(rgbs))
+    except Exception:  # noqa: BLE001
+        return [_ocr_canvas_all(c, engine) for c in canvases]
+    if len(raws) != len(canvases):
+        # engine did not preserve 1:1 ordering -> safe per-canvas fallback.
+        return [_ocr_canvas_all(c, engine) for c in canvases]
+    return [_result_to_all(raws[i], float(canvases[i].shape[1]), float(canvases[i].shape[0]))
+            for i in range(len(canvases))]
 
 
 _MEAS_RE = re.compile(r"^\(?\d{1,4}[.,]\d{1,2}\)?$")
@@ -893,23 +930,45 @@ def _extract_glyph_detections(
     # sub-groups.  See _expand_glyph_groups for full rationale.
     expanded_groups: list[Any] = _expand_glyph_groups(groups)
 
-    for idx, group in enumerate(expanded_groups):
+    # --- PHASE 1 (CPU): render every group's two flip canvases up front. No OCR yet,
+    #     so this is pure image work that the per-worker thread pool parallelises.
+    from .pdf_glyphs import render_glyph_group  # ensure local ref  # noqa: PLC0415
+    prepared: list[tuple[Any, float | None, np.ndarray, np.ndarray]] = []
+    for group in expanded_groups:
         try:
-            # --- angle: prefer nearest line, fall back to glyph shape ----------
             nearest_seg = _find_nearest_line(group.center, all_segments)
-            line_angle: float | None = (
+            angle_for_render: float | None = (
                 _seg_angle_deg(nearest_seg) if nearest_seg is not None else None
             )
-            angle_for_render = line_angle  # None → render_glyph_group uses group.angle_deg
-
-            # --- render both flips with line-guided (or shape) angle ----------
             img1 = render_glyph_group(group, flip=False, angle_override_deg=angle_for_render)
             img2 = render_glyph_group(group, flip=True,  angle_override_deg=angle_for_render)
-            pre1 = _preprocess_canvas(img1)
-            pre2 = _preprocess_canvas(img2)
+            prepared.append((group, angle_for_render,
+                             _preprocess_canvas(img1), _preprocess_canvas(img2)))
+        except Exception:  # noqa: BLE001 - a bad group must not stop the page
+            prepared.append((group, None, None, None))  # type: ignore[arg-type]
 
-            all1 = _ocr_canvas_all(pre1, engine)
-            all2 = _ocr_canvas_all(pre2, engine)
+    # --- PHASE 2 (GPU, ONE call): OCR ALL flip canvases in a single batched predict.
+    #     ~2 canvases/group -> one batch instead of hundreds of per-glyph calls.
+    flat_canvases: list[np.ndarray] = []
+    slot: list[tuple[int, int] | None] = []  # (index into prepared, flip 0/1) per canvas
+    for pi, (_g, _a, p1, p2) in enumerate(prepared):
+        if p1 is not None:
+            slot.append((pi, 0)); flat_canvases.append(p1)
+        if p2 is not None:
+            slot.append((pi, 1)); flat_canvases.append(p2)
+    batch_all = _ocr_canvases_batch(flat_canvases, engine)
+    per_group_all: dict[int, list[list[tuple[str, float, tuple[float, float]]]]] = {}
+    for ci, res in enumerate(batch_all):
+        pi, flip = slot[ci]  # type: ignore[misc]
+        per_group_all.setdefault(pi, [[], []])[flip] = res
+
+    # --- PHASE 3 (per-group): merge + conditional low-confidence fallbacks.
+    for idx, (group, angle_for_render, pre1, pre2) in enumerate(prepared):
+        try:
+            if pre1 is None:
+                continue
+            line_angle = angle_for_render  # alias for debug-save calls below
+            all1, all2 = per_group_all.get(idx, [[], []])
 
             # Merge: keep highest-confidence reading for each unique text.
             merged: dict[str, tuple[str, float, tuple[float, float], bool]] = {}

@@ -206,6 +206,14 @@ def write_georef_dxf(
             idx = stone_label_to_index[label]
             _set_text_pos(e, float(adjusted_stone_positions[idx, 0]),
                           float(adjusted_stone_positions[idx, 1]))
+            # RIGID placement: the stone-number label turns with the plot like every
+            # other label (the position comes from the adjusted fit, but the glyph
+            # must still rotate by the plot angle -- else numbers stay axis-aligned
+            # while the geometry is turned).
+            _theta_st = _rotation_deg(R)
+            if _theta_st:
+                cur = float(e.dxf.rotation) if e.dxf.hasattr("rotation") else 0.0
+                e.dxf.rotation = (cur + _theta_st) % 360.0
         else:
             _xform_text(e, R, s, t)
 

@@ -25,17 +25,28 @@ _log = logging.getLogger(__name__)
 MAX_INDUCED_ERROR_M = 2.0
 MIN_BASELINE_M = 5.0
 
+# Minimum resolved control points for a FULL-QUALITY seat. With 3+ the similarity
+# is a LEAST-SQUARES fit (per-point GPS error averages out); an exact 2-point solve
+# passes any point error straight into the placement. Client directive 2026-07-02:
+# match a minimum of 3 stone points per FMB. A 2-point seat is still computed but
+# is demoted to REVIEW (seed_ok=False), never silently ACCEPTed.
+MIN_CONTROL_POINTS = 3
+
 
 def gps_seat(
     m1: M1PlotData,
     control_points: list[tuple[str, tuple[float, float]]],
 ) -> CandidatePlacement | None:
-    """Place ``m1`` from >=2 (corner_label, (utm_x, utm_y)) control points.
+    """Place ``m1`` from (corner_label, (utm_x, utm_y)) control points.
 
-    Matches each control label to its STONE on the M1 plot, fits the 2-point (or
-    least-squares for >2) similarity, and returns a ``CandidatePlacement``
-    (``method="gps_seed"``). ``passes_gate``/``seed_ok`` reflect the seed-quality
-    baseline check. Returns None if fewer than two labels resolve to stones.
+    Matches each control label to its STONE on the M1 plot and fits the similarity
+    by least squares over ALL resolved points. Quality policy (general, applies to
+    every village):
+      * >= MIN_CONTROL_POINTS (3) resolved AND baseline + residual gates pass
+        -> ``seed_ok=True`` (ACCEPT_SEEDED disposition).
+      * exactly 2 resolved -> placement returned but ``seed_ok=False`` (REVIEW):
+        a 2-point fit has no redundancy, so a human confirms it.
+      * < 2 resolved -> None (cannot determine the similarity at all).
     """
     if not control_points:
         return None
@@ -58,7 +69,7 @@ def gps_seat(
 
     src = np.array(src_pts, dtype=float)
     dst = np.array(dst_pts, dtype=float)
-    R, s, t, _resid = umeyama(src, dst)
+    R, s, t, resid = umeyama(src, dst)
 
     if not (0.5 < s < 2.0):
         _log.warning("GPS seat for survey %s: implausible scale %.3f -> rejected "
@@ -68,17 +79,36 @@ def gps_seat(
     all_pos = m1.stone_positions()
     adjusted = s * (all_pos @ R.T) + t
 
-    sq = seed_quality(src[:2], dst[:2], template_points=all_pos,
+    # Baseline check on the FARTHEST-apart control pair (worst-case lever arm),
+    # not an arbitrary first two.
+    d2 = ((src[:, None, :] - src[None, :, :]) ** 2).sum(axis=2)
+    bi, bj = np.unravel_index(int(np.argmax(d2)), d2.shape)
+    sq = seed_quality(src[[bi, bj]], dst[[bi, bj]], template_points=all_pos,
                       max_induced_error_m=MAX_INDUCED_ERROR_M,
                       min_baseline_m=MIN_BASELINE_M)
+
+    n_pts = len(src_pts)
+    max_resid = float(np.max(resid)) if np.all(np.isfinite(resid)) else float("inf")
+    if n_pts < MIN_CONTROL_POINTS:
+        seed_ok, note = False, (f"only {n_pts} control points resolved "
+                                f"(<{MIN_CONTROL_POINTS} minimum) -> REVIEW")
+        _log.warning("GPS seat for survey %s: %s", m1.survey_number, note)
+    elif max_resid > MAX_INDUCED_ERROR_M:
+        # 3+ points give a residual: a control point that disagrees with the fit
+        # by more than the survey-grade bound means bad GPS or a mislabel.
+        seed_ok, note = False, (f"LSQ residual {max_resid:.2f} m > "
+                                f"{MAX_INDUCED_ERROR_M} m -> REVIEW")
+        _log.warning("GPS seat for survey %s: %s", m1.survey_number, note)
+    else:
+        seed_ok, note = sq.ok, ("" if sq.ok else sq.reason)
 
     return CandidatePlacement(
         method="gps_seed",
         R=R, s=float(s), t=t,
         adjusted=adjusted,
         corner_ring=list(m1.outer_stone_indices),
-        passes_gate=sq.ok,
+        passes_gate=seed_ok,
         scale=float(s),
-        seed_ok=sq.ok,
-        note="" if sq.ok else sq.reason,
+        seed_ok=seed_ok,
+        note=note,
     )

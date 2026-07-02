@@ -63,27 +63,61 @@ def test_cadastral_seat_off_seat_label_demotes(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# Method 2: GPS / control-point seat (2-corner similarity + seed quality).
+# Method 2: GPS / control-point seat (>=3-point LSQ similarity + seed quality).
 # --------------------------------------------------------------------------
 
 def test_gps_seat_places_corners_on_control(tmp_path):
+    dxf = build_fmb(tmp_path / "m1_100.dxf", "100", RECT)
+    m1 = extract_m1_dxf(dxf)
+    # Client directive 2026-07-02: minimum 3 stone matches per FMB for full quality.
+    control = [("A", (BASE_X, BASE_Y)), ("B", (BASE_X + 50.0, BASE_Y)),
+               ("C", (BASE_X + 50.0, BASE_Y + 30.0))]
+
+    cand = gps_seat(m1, control)
+    assert cand is not None and cand.method == "gps_seed"
+    assert cand.seed_ok and cand.passes_gate          # 3 points, adequate baseline
+    idx = {s.label: s.index for s in m1.stones}
+    assert np.allclose(cand.adjusted[idx["A"]], [BASE_X, BASE_Y], atol=0.5)
+    assert np.allclose(cand.adjusted[idx["B"]], [BASE_X + 50, BASE_Y], atol=0.5)
+    assert np.allclose(cand.adjusted[idx["C"]], [BASE_X + 50, BASE_Y + 30], atol=0.5)
+
+
+def test_gps_seat_two_points_is_review(tmp_path):
+    """A 2-point seat has no redundancy: still placed, but demoted to REVIEW
+    (seed_ok=False) -- min 3 stone matches for ACCEPT_SEEDED."""
     dxf = build_fmb(tmp_path / "m1_100.dxf", "100", RECT)
     m1 = extract_m1_dxf(dxf)
     control = [("A", (BASE_X, BASE_Y)), ("B", (BASE_X + 50.0, BASE_Y))]
 
     cand = gps_seat(m1, control)
     assert cand is not None and cand.method == "gps_seed"
-    assert cand.seed_ok and cand.passes_gate          # 50 m baseline is adequate
+    assert not cand.seed_ok and not cand.passes_gate
+    assert "control points" in cand.note
+    # geometry itself is still the exact 2-point placement (position is right)
     idx = {s.label: s.index for s in m1.stones}
     assert np.allclose(cand.adjusted[idx["A"]], [BASE_X, BASE_Y], atol=0.5)
-    assert np.allclose(cand.adjusted[idx["B"]], [BASE_X + 50, BASE_Y], atol=0.5)
+
+
+def test_gps_seat_bad_control_point_is_review(tmp_path):
+    """3 points where one disagrees with the fit by >2 m -> REVIEW (LSQ residual
+    gate catches bad GPS / mislabels that a 2-point fit would swallow silently)."""
+    dxf = build_fmb(tmp_path / "m1_100.dxf", "100", RECT)
+    m1 = extract_m1_dxf(dxf)
+    control = [("A", (BASE_X, BASE_Y)), ("B", (BASE_X + 50.0, BASE_Y)),
+               ("C", (BASE_X + 50.0 + 8.0, BASE_Y + 30.0 + 8.0))]  # ~11 m off
+
+    cand = gps_seat(m1, control)
+    assert cand is not None
+    assert not cand.seed_ok and not cand.passes_gate
+    assert "residual" in cand.note
 
 
 def test_gps_seat_short_baseline_not_ok(tmp_path):
     tiny = [("A", 0.0, 0.0), ("B", 3.0, 0.0), ("C", 3.0, 2.0), ("D", 0.0, 2.0)]
     dxf = build_fmb(tmp_path / "m1_tiny.dxf", "200", tiny)
     m1 = extract_m1_dxf(dxf)
-    control = [("A", (BASE_X, BASE_Y)), ("B", (BASE_X + 3.0, BASE_Y))]  # 3 m baseline
+    control = [("A", (BASE_X, BASE_Y)), ("B", (BASE_X + 3.0, BASE_Y)),
+               ("C", (BASE_X + 3.0, BASE_Y + 2.0))]  # 3 points but ~3.6 m baseline
 
     cand = gps_seat(m1, control)
     assert cand is not None
@@ -155,8 +189,10 @@ def test_pipeline_propagates_neighbor_without_parcel(tmp_path):
     a = build_fmb(tmp_path / "m1_100.dxf", "100", RECT, [("101", (52.0, 15.0))])
     rect_b = [("P", 0.0, 0.0), ("Q", 40.0, 0.0), ("R", 40.0, 30.0), ("S", 0.0, 30.0)]
     b = build_fmb(tmp_path / "m1_101.dxf", "101", rect_b, [("100", (-2.0, 15.0))])
-    # A gets an absolute seat from GPS; B has neither parcel nor GPS.
-    gps = {"100": [("A", (BASE_X, BASE_Y)), ("B", (BASE_X + 50.0, BASE_Y))]}
+    # A gets an absolute seat from GPS (3 control points = full quality);
+    # B has neither parcel nor GPS.
+    gps = {"100": [("A", (BASE_X, BASE_Y)), ("B", (BASE_X + 50.0, BASE_Y)),
+                   ("C", (BASE_X + 50.0, BASE_Y + 30.0))]}
 
     results = club_pipeline([a, b], tmp_path / "out", gps_control=gps)
     by = {r.survey_number: r for r in results}

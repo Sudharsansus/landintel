@@ -144,15 +144,12 @@ def club_dxf(
             src = ezdxf.readfile(str(gp))
         except Exception:  # noqa: BLE001
             continue
-        layer = f"REVIEW_FMB_{sn}"
-        if layer not in src.layers:
-            src.layers.add(layer, color=30)   # orange = needs human confirmation
-        for e in src.modelspace():
-            try:
-                e.dxf.layer = layer
-                e.dxf.color = 256
-            except Exception:  # noqa: BLE001
-                pass
+        # REVIEW plots ARE georeferenced at their cadastral position (they are only
+        # lower-confidence, and are tracked as REVIEW in clubbed_points.csv + the
+        # dispositions/verify). Render them with their NORMAL layers/colours -- the
+        # old behaviour flattened every entity onto one orange layer, which made a
+        # thin sliver plot (e.g. 776) read as a stray orange line across the map.
+        # The block name still encodes REVIEW_FMB_<sn> for traceability in CAD.
         _import_as_block(base, src, f"REVIEW_FMB_{sn}")
         n_review += 1
 
