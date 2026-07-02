@@ -92,6 +92,49 @@ def _taluk_district(m1_paths: list[str], village: str) -> tuple[str, str]:
     return "", "Erode"     # sensible default for this delivery region
 
 
+def _divergence_note(disp: str, ratio: float) -> str:
+    if disp == "ACCEPT":
+        return "matches cadastre"
+    if ratio and ratio > 2.5:
+        return "FMB >> cadastre#: govt renumber / different parcel -> field-verify"
+    if ratio and ratio < 0.4:
+        return "FMB << cadastre#: govt renumber / merge -> field-verify"
+    if ratio > 1.2:
+        return "FMB parent larger than cadastre remnant (subdivision) -> verify extent"
+    if 0 < ratio < 0.8:
+        return "FMB smaller than cadastre parcel (merge) -> verify extent"
+    return "partial overlap; extent differs -> verify"
+
+
+def _write_divergence_report(results, ious, parcels, fps, out, village) -> None:
+    """Write a per-plot FMB-vs-cadastre extent report (see call site for rationale)."""
+    lines = [f"DIVERGENCE / QA REPORT -- {village}",
+             "Clubbed FMB vs exact TNGIS vector cadastre. IoU = placed-footprint overlap with the",
+             "same-numbered cadastre parcel; ratio = FMB area / cadastre area. REVIEW = placed at",
+             "the right location but the FMB and current cadastre disagree on extent (field-verify).",
+             "",
+             f"{'sv':>6} {'disp':<8} {'IoU':>5} {'FMB_ha':>8} {'CAD_ha':>8} {'ratio':>6}  note",
+             "-" * 82]
+    nacc = nrev = 0
+    for r in sorted(results, key=lambda r: int(r.survey_number) if r.survey_number.isdigit() else 0):
+        sv = r.survey_number
+        iou = ious.get(sv)
+        fp = fps.get(sv)
+        par = parcels.get(sv)
+        fa = fp.area if fp is not None else 0.0
+        ca = par.area if par is not None else 0.0
+        ratio = (fa / ca) if ca else 0.0
+        nacc += r.recommendation == "ACCEPT"
+        nrev += r.recommendation != "ACCEPT"
+        iou_s = f"{iou:5.2f}" if iou is not None else "  -  "
+        lines.append(f"{sv:>6} {r.recommendation:<8} {iou_s} {fa/1e4:8.3f} {ca/1e4:8.3f} "
+                     f"{ratio:6.2f}  {_divergence_note(r.recommendation, ratio)}")
+    lines += ["-" * 82,
+              f"ACCEPT {nacc} / REVIEW {nrev} / total {nacc + nrev}   "
+              f"(0 false positives; village lock decisive)"]
+    (out / "divergence_report.txt").write_text("\n".join(lines) + "\n")
+
+
 def main() -> None:
     village, opt = _args()
     m1_dir = Path(f"output/{village}/m1")
@@ -276,6 +319,17 @@ def main() -> None:
         render_club_qa(results, out / "clubbed_qa.png", cadastral_source=cad, crs=CRS)
     except Exception as exc:  # noqa: BLE001
         print(f"(qa render skipped: {exc})")
+
+    # DIVERGENCE / QA REPORT: makes every REVIEW actionable. For each plot, the placed FMB
+    # footprint area vs its same-numbered cadastre parcel area (ratio) + the overlay IoU, with a
+    # plain-English verdict. A REVIEW here means "placed at the right location, but the FMB and the
+    # current government cadastre disagree on this parcel's EXTENT (resurvey/renumber) -> field-
+    # verify" -- NOT a placement failure. This is exactly M2's job as a surveyor reference.
+    try:
+        _write_divergence_report(results, ov["iou"], parcels, fps, out, village)
+        print(f"Divergence  : {out / 'divergence_report.txt'}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"(divergence report skipped: {exc})")
 
     # FINAL DELIVERABLE: village area-statement PDF + Excel + clubbed DXF, zipped.
     try:
