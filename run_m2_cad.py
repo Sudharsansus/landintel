@@ -60,8 +60,14 @@ IOU_CONTRADICT = float(os.environ.get("LANDINTEL_IOU_CONTRADICT", "0.15"))
 def _args() -> tuple[str, float, float, float]:
     a = sys.argv[1:]
     village = a[0]
+    # Use the EXACT vector cadastre by default when the TNGIS GeoParquet is present (it strictly
+    # dominates z18 tile OCR); fall back to tiles if absent or when forced with --tiles.
+    _parq = os.environ.get("LANDINTEL_TNGIS_PARQUET", "data/tngis/TNGIS_TN_Cadastrals.parquet")
+    _env = os.environ.get("LANDINTEL_CADASTRAL")
+    _use_vec = ("--vector" in a) or _env == "vector" or (
+        _env != "tiles" and "--tiles" not in a and Path(_parq).exists())
     opt = {"radius_km": 2.5, "cx": None, "cy": None, "taluk": "", "district": "",
-           "vector": ("--vector" in a) or os.environ.get("LANDINTEL_CADASTRAL") == "vector"}
+           "vector": _use_vec}
     if "--radius-km" in a:
         opt["radius_km"] = float(a[a.index("--radius-km") + 1])
     if "--taluk" in a:
