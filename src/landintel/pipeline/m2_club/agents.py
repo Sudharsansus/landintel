@@ -27,8 +27,11 @@ from shapely.ops import unary_union
 def overlay_gate(recommendation: str, iou: float | None, *,
                  seated: bool, has_placement: bool, in_demote: bool,
                  is_vector_parcel: bool, contested: bool,
+                 containment: float | None = None, area_factor: float | None = None,
+                 decisive_lock: bool = False,
                  iou_accept: float = 0.5, iou_strong: float = 0.6,
-                 iou_contradict: float = 0.15) -> tuple[str, str | None]:
+                 iou_contradict: float = 0.15,
+                 contain_min: float = 0.90, factor_max: float = 2.5) -> tuple[str, str | None]:
     """0-FP TNGIS-overlay disposition for ONE plot. Pure + testable; returns
     ``(recommendation, reason)``. This is the single arbiter used by run_m2_cad so the
     false-positive discipline is locked by tests rather than living inline in a script.
@@ -37,14 +40,22 @@ def overlay_gate(recommendation: str, iou: float | None, *,
       * DEMOTE  ACCEPT -> REVIEW  when the parcel is a REAL vector ring but IoU < iou_contradict
         (self-contradiction: placed away from the parcel carrying its number, e.g. a mislabel).
       * PROMOTE non-ACCEPT -> ACCEPT (only if it has a placement and was not demoted for overlap)
-        when EITHER
-          STRONG: IoU >= iou_strong AND parcel is a real vector ring AND label uncontested, OR
-          SEATED: IoU >= iou_accept AND not flagged off-seat.
+        when ANY of:
+          STRONG:     IoU >= iou_strong AND real vector ring AND label uncontested, OR
+          SEATED:     IoU >= iou_accept AND not flagged off-seat, OR
+          SAME-PARCEL: the village lock is DECISIVE and the plot's exact same-numbered vector
+                       parcel is near-totally CONTAINED in the placed footprint (or vice versa,
+                       ``containment >= contain_min``) within a ``<= factor_max`` area factor.
+                       This is the FMB-parent / cadastre-subdivision case: one parcel nested in
+                       the other of the same number = same land, correct LOCATION, only the
+                       EXTENT diverged (flagged in the divergence report). IoU alone under-counts
+                       it because the size difference caps IoU at 1/factor.
       * otherwise unchanged.
 
-    0-FP: promotion needs genuine overlap with the plot's OWN parcel; the STRONG path additionally
-    requires an uncontested vector parcel, closing the only blind spot IoU cannot see (a
-    mislabelled-but-congruent parcel). Demotion only ever REMOVES an ACCEPT."""
+    0-FP: every promotion needs genuine overlap with the plot's OWN parcel. STRONG needs an
+    uncontested vector parcel; SAME-PARCEL needs a DECISIVE village lock plus near-total mutual
+    containment within a bounded size factor -- a wrong/renumbered parcel is neither contained nor
+    within-factor (e.g. a 10x or 0.03x size parcel fails ``factor_max``). Demotion only removes."""
     if recommendation == "ACCEPT":
         if is_vector_parcel and iou is not None and iou < iou_contradict:
             return "REVIEW", f"IoU-contradiction {iou:.2f} vs own parcel"
@@ -54,9 +65,16 @@ def overlay_gate(recommendation: str, iou: float | None, *,
     v = iou or 0.0
     strong = (v >= iou_strong and is_vector_parcel and not contested)
     seated_ok = (v >= iou_accept and seated)
-    if strong or seated_ok:
-        tag = "strong/uncontested overlay" if (strong and not seated_ok) else "overlays TNGIS"
-        return "ACCEPT", f"IoU-gate: {tag} {v:.2f}"
+    same_parcel = (decisive_lock and is_vector_parcel and not contested
+                   and containment is not None and containment >= contain_min
+                   and area_factor is not None and area_factor <= factor_max)
+    if seated_ok:
+        return "ACCEPT", f"IoU-gate: overlays TNGIS {v:.2f}"
+    if strong:
+        return "ACCEPT", f"IoU-gate: strong/uncontested overlay {v:.2f}"
+    if same_parcel:
+        return "ACCEPT", (f"IoU-gate: same parcel: cadastre {containment:.0%} contained in "
+                          f"footprint (extent diverged x{area_factor:.2f}, IoU {v:.2f})")
     return recommendation, None
 
 

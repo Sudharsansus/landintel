@@ -203,6 +203,7 @@ def main() -> None:
         engine = _default_engine()                     # build ONE OCR engine, reuse per block
 
     best = None
+    cand_means: list[float] = []
     for i, cand in enumerate(eval_cands):
         n_sv = cand.get("n_overlap", cand.get("n", len(surveys)))
         label = f"village vc={cand['vc']}" if opt["vector"] else "block"
@@ -233,10 +234,17 @@ def main() -> None:
         print(f"      {tag}: TNGIS-overlay IoU={ov_i['mean_iou']:.2f} "
               f"(strong>={IOU_ACCEPT}: {n_high}) rigid-ACCEPT={n_acc}")
         score = (n_high, round(ov_i["mean_iou"], 3))
+        cand_means.append(ov_i["mean_iou"])
         if best is None or score > best[0]:
             best = (score, cad_i, res_i, cand)
     if best is None:
         raise SystemExit(f"no candidate block yielded a placement for {village}")
+    # DECISIVE lock: the chosen village's overlay clearly beats the runner-up (>= 1.25x). Only then
+    # is the same-parcel (subdivision-containment) ACCEPT path enabled -- it needs the village to be
+    # unambiguously ours before trusting containment as identity.
+    _means = sorted(cand_means, reverse=True)
+    _runner = _means[1] if len(_means) > 1 else 0.0
+    decisive_lock = bool(_means and _means[0] >= 0.5 and _means[0] >= 1.25 * _runner)
     _score, cad, results, chosen = best
     print(f"      -> chosen village block @ {chosen.get('center')} span={chosen.get('span_m')}m "
           f"(TNGIS-overlay IoU={_score[0]}, ACCEPT={_score[1]})")
@@ -275,10 +283,24 @@ def main() -> None:
     # TNGIS-overlay disposition (math, 0-FP) via the single tested arbiter overlay_gate:
     # promotes a strongly/seated overlaying plot to ACCEPT, demotes a self-contradicting ACCEPT
     # to REVIEW. See overlay_gate for the exact 0-FP rules.
+    def _containment_factor(sv: str):
+        """(containment, area_factor) of the placed footprint vs its own cadastre parcel.
+        containment = intersection / area(smaller); area_factor = area(larger)/area(smaller).
+        Near-total containment within a bounded factor = the FMB and cadastre parcel are the same
+        land (one a subdivision/merge of the other) -> same LOCATION even if the EXTENT diverged."""
+        fp = fps.get(sv)
+        par = parcels.get(sv)
+        if fp is None or par is None or fp.area <= 0 or par.area <= 0:
+            return None, None
+        inter = fp.intersection(par).area
+        small = min(fp.area, par.area)
+        return (inter / small if small else 0.0), (max(fp.area, par.area) / small)
+
     n_iou_up = n_contra = 0
     for r in results:
         sv = r.survey_number
         before = r.recommendation
+        _cont, _fac = _containment_factor(sv)
         new_rec, reason = overlay_gate(
             before, ov["iou"].get(sv),
             seated="off-seat" not in (r.note or ""),
@@ -286,6 +308,7 @@ def main() -> None:
             in_demote=sv in asm["demote"],
             is_vector_parcel=cad.is_vector_parcel(sv),
             contested=_contested(sv),
+            containment=_cont, area_factor=_fac, decisive_lock=decisive_lock,
             iou_accept=IOU_ACCEPT, iou_strong=IOU_STRONG, iou_contradict=IOU_CONTRADICT)
         if new_rec != before:
             r.recommendation = new_rec

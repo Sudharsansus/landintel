@@ -133,3 +133,27 @@ def test_gate_keeps_good_accept_and_ignores_boxed_parcel():
     assert _gate("ACCEPT", 0.80)[0] == "ACCEPT"                        # good ACCEPT kept
     # a boxed (non-vector) parcel with low IoU is NOT demoted (no trustworthy geometry).
     assert _gate("ACCEPT", 0.00, is_vector_parcel=False)[0] == "ACCEPT"
+
+
+def test_gate_same_parcel_containment_promotes_subdivision():
+    # 14-like: cadastre parcel 99% inside the FMB footprint, extent diverged 2.3x, IoU 0.43 (<0.5)
+    # -> same land (parent/subdivision), decisive lock -> ACCEPT.
+    rec, reason = _gate("REVIEW", 0.43, seated=False, containment=0.99,
+                        area_factor=2.30, decisive_lock=True)
+    assert rec == "ACCEPT" and "same parcel" in reason
+
+
+def test_gate_same_parcel_needs_decisive_lock():
+    # identical geometry but the village lock is NOT decisive -> stays REVIEW (could be wrong village)
+    assert _gate("REVIEW", 0.43, seated=False, containment=0.99, area_factor=2.30,
+                 decisive_lock=False)[0] == "REVIEW"
+
+
+def test_gate_same_parcel_rejects_gross_size_mismatch():
+    # 55-like: cadastre tiny fragment fully inside a 10x-bigger FMB -> factor 10 > 2.5 -> REVIEW
+    # (a renumbered/different parcel, not a subdivision remnant).
+    assert _gate("REVIEW", 0.10, seated=False, containment=1.0, area_factor=10.5,
+                 decisive_lock=True)[0] == "REVIEW"
+    # 37-like: only partially contained (0.64 < 0.90) -> REVIEW even with decisive lock.
+    assert _gate("REVIEW", 0.34, seated=False, containment=0.64, area_factor=1.51,
+                 decisive_lock=True)[0] == "REVIEW"
