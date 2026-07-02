@@ -335,25 +335,34 @@ def _cached_locate(tiles, grid, surveys: set[str], cache_dir: str,
 
 def locate_village(village: str, surveys: set[str], crs: str, cache_dir: str,
                    taluk: str = "", district: str = "", state: str = "Tamil Nadu",
-                   use_qwen: bool = True):
-    """Full locator: rough anchor (geocode, Qwen+web fallback) -> survey-number fingerprint
-    -> CANDIDATE VILLAGE BLOCKS.
+                   use_qwen: bool = True, anchor_latlon: tuple[float, float] | None = None):
+    """Full locator: rough anchor (geocode, Qwen+web fallback, or an EXPLICIT web-provided
+    anchor) -> survey-number fingerprint -> CANDIDATE VILLAGE BLOCKS.
+
+    ``anchor_latlon`` (lat, lon), when given, OVERRIDES geocoding -- this is the web-anchor
+    path (a Google/pincode/Nominatim lookup outside the pipeline pins the village centre,
+    since a tiny revenue village often does not geocode from its name alone). Density-peak
+    clustering + FMB-shape IoU still refine WHICH block near that anchor is really ours, so a
+    coarse (centroid-precision) web anchor is enough.
 
     Returns ``(candidates, info)``; ``candidates`` is a list of dense village blocks that
-    share our survey numbers (largest first, each with ``bbox``/``fence``). The caller
-    picks the real one by FMB-shape agreement. Empty list if nothing locked."""
+    share our survey numbers (largest first, each with ``bbox``/``fence``). Empty if nothing
+    locked."""
     from pyproj import Transformer
     to_utm = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
 
     info: dict = {"village": village, "taluk": taluk, "district": district}
-    anchor = rough_center(village, taluk, district, state)
-    level = anchor[1] if anchor else None
-    latlon = anchor[0] if anchor else None
-    # Qwen disambiguation when the village itself did not geocode (only taluk/district hit).
-    if use_qwen and (latlon is None or level != "village"):
-        q = qwen_center(village, taluk, district, state)
-        if q is not None:
-            latlon, level = q, "qwen"
+    if anchor_latlon is not None:                       # web-provided anchor wins
+        latlon, level = (float(anchor_latlon[0]), float(anchor_latlon[1])), "web"
+    else:
+        anchor = rough_center(village, taluk, district, state)
+        level = anchor[1] if anchor else None
+        latlon = anchor[0] if anchor else None
+        # Qwen disambiguation when the village itself did not geocode (only taluk/district).
+        if use_qwen and (latlon is None or level != "village"):
+            q = qwen_center(village, taluk, district, state)
+            if q is not None:
+                latlon, level = q, "qwen"
     if latlon is None:
         raise RuntimeError(f"could not locate {village} ({taluk}, {district}) at all")
     cx, cy = to_utm.transform(latlon[1], latlon[0])

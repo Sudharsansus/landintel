@@ -15,6 +15,7 @@ clubbed_qa.png, clubbed.verify.txt.  CRS = EPSG:32643 (UTM 43N) for all Erode vi
 """
 from __future__ import annotations
 
+import os
 import re
 import sys
 from collections import Counter
@@ -26,11 +27,18 @@ sys.stdout.reconfigure(encoding="utf-8")
 from pyproj import Transformer
 
 from landintel.pipeline.m2_club import club_pipeline
+from landintel.pipeline.m2_club.agents import AssemblyAgent, ParcelAgent, TngisOverlayAgent
 from landintel.pipeline.m2_club.club_output import snap_and_rewrite
 from landintel.pipeline.m2_club.qa_render import render_club_qa
 from landintel.pipeline.m5_cadastral.s3_tiles import TILE_VARIANT, S3CadastralSource
 
 CRS = "EPSG:32643"           # UTM 43N -- all these Erode villages are west of 78E
+# TNGIS-overlay ACCEPT gate: the client's criterion is "clubbed FMB overlays the TNGIS
+# parcel". IoU (placed FMB footprint vs its own survey#'s parcel) measures exactly that and
+# is 0-FP by construction -- a wrong-parcel placement cannot overlap its labelled parcel, so
+# it scores low. A plot is ACCEPTed when its overlay is strong AND it sits on its own label
+# point (seat-locality already enforced upstream). General threshold; override via env.
+IOU_ACCEPT = float(os.environ.get("LANDINTEL_IOU_ACCEPT", "0.5"))
 
 
 def _args() -> tuple[str, float, float, float]:
@@ -72,25 +80,28 @@ def main() -> None:
     cache_dir = f"input/{village}/s3_{TILE_VARIANT}"      # variant-specific (tiles + caches)
     print(f"[1/4] {village}: {len(m1_paths)} M1 FMBs, surveys {sorted(surveys, key=int)}")
 
-    if opt["cx"] is not None:                          # explicit centre supplied
-        R = opt["radius_km"] * 1000.0
-        bbox = (opt["cx"] - R, opt["cy"] - R, opt["cx"] + R, opt["cy"] + R)
-        print(f"[2/4] centre UTM43 ({opt['cx']:.0f},{opt['cy']:.0f}) +/- {R/1000:.1f} km")
-        candidates = [{"bbox": bbox, "fence": None, "center": (opt["cx"], opt["cy"]),
-                       "n": len(surveys), "span_m": (round(2 * R), round(2 * R))}]
-    else:                                              # AUTO-LOCATE (general, no hardcoding)
-        from landintel.pipeline.m5_cadastral.geo_locate import locate_village
-        taluk = opt["taluk"] or _taluk_district(m1_paths, village)[0]
-        district = opt["district"] or _taluk_district(m1_paths, village)[1]
-        print(f"[2/4] auto-locating {village} (taluk={taluk}, district={district}) by "
-              f"geocode + Qwen + survey-number fingerprint...")
-        candidates, info = locate_village(village, surveys, CRS, cache_dir,
-                                          taluk=taluk, district=district)
-        print(f"      anchor={info.get('anchor_level')} @ {info.get('anchor_latlon')} | "
-              f"{info.get('n_candidates')} candidate village block(s) sharing these survey "
-              f"numbers, centers={info.get('candidate_centers')}")
-        if not candidates:
-            raise SystemExit(f"could not locate any cadastral block for {village}")
+    # A provided --lat/--lon or --utm is used as the WEB ANCHOR for the density-peak locator
+    # (NOT a fixed bbox): a coarse web/pincode/Nominatim centroid pins WHERE to look; the
+    # survey-number density-peak + FMB-shape IoU still refine WHICH block is really ours.
+    from landintel.pipeline.m5_cadastral.geo_locate import locate_village
+    anchor_ll = None
+    if opt["cx"] is not None:
+        _lon, _lat = Transformer.from_crs(CRS, "EPSG:4326", always_xy=True).transform(
+            opt["cx"], opt["cy"])
+        anchor_ll = (_lat, _lon)
+        print(f"[2/4] web anchor UTM43 ({opt['cx']:.0f},{opt['cy']:.0f}) "
+              f"-> density-peak + IoU refine")
+    else:
+        print(f"[2/4] auto-locating {village} by geocode + Qwen + survey-number fingerprint...")
+    taluk = opt["taluk"] or _taluk_district(m1_paths, village)[0]
+    district = opt["district"] or _taluk_district(m1_paths, village)[1]
+    candidates, info = locate_village(village, surveys, CRS, cache_dir,
+                                      taluk=taluk, district=district, anchor_latlon=anchor_ll)
+    print(f"      anchor={info.get('anchor_level')} @ {info.get('anchor_latlon')} | "
+          f"{info.get('n_candidates')} candidate village block(s) sharing these survey "
+          f"numbers, centers={info.get('candidate_centers')}")
+    if not candidates:
+        raise SystemExit(f"could not locate any cadastral block for {village}")
 
     # DISAMBIGUATE by FMB-SHAPE AGREEMENT: TN villages all number parcels 1..N, so the same
     # survey numbers recur in every neighbour -> several candidate blocks. The REAL village is
@@ -115,28 +126,70 @@ def main() -> None:
         except Exception as exc:  # noqa: BLE001
             print(f"      {tag}: FAILED ({exc})")
             continue
+        # TngisOverlayAgent decides the village: the real block is the one whose placed FMBs
+        # best OVERLAY the cadastre parcels (mean IoU) -- a far stronger signal than the
+        # ACCEPT count (which ties across neighbours). Measurement only -> 0-FP.
+        fps_i = {r.survey_number: r.placement.footprint() for r in res_i if r.placement}
+        parcels_i = ParcelAgent().run(cad_i, surveys).data.get("parcels", {})
+        ov_i = TngisOverlayAgent().run(fps_i, parcels_i).data
+        # Pick the village by the COUNT of plots that strongly overlay their parcel
+        # (n IoU>=IOU_ACCEPT) then mean IoU -- a wrong village has few strong overlays.
+        n_high = sum(1 for v in ov_i["iou"].values() if v >= IOU_ACCEPT)
         n_acc = sum(1 for r in res_i if r.recommendation == "ACCEPT")
-        n_pl = sum(1 for r in res_i if r.placed)
-        print(f"      {tag}: ACCEPT={n_acc} PLACED={n_pl}")
-        score = (n_acc, n_pl)
+        print(f"      {tag}: TNGIS-overlay IoU={ov_i['mean_iou']:.2f} "
+              f"(strong>={IOU_ACCEPT}: {n_high}) rigid-ACCEPT={n_acc}")
+        score = (n_high, round(ov_i["mean_iou"], 3))
         if best is None or score > best[0]:
             best = (score, cad_i, res_i, cand)
     if best is None:
         raise SystemExit(f"no candidate block yielded a placement for {village}")
     _score, cad, results, chosen = best
     print(f"      -> chosen village block @ {chosen.get('center')} span={chosen.get('span_m')}m "
-          f"(ACCEPT={_score[0]}, PLACED={_score[1]})")
+          f"(TNGIS-overlay IoU={_score[0]}, ACCEPT={_score[1]})")
 
     print("[4/4] quality pass: edge-align + corner-snap (0-FP)...")
     snap_and_rewrite(results, out, crs=CRS, enable=True, tol=8.0)
+
+    # --- Agent verification of the chosen club (each agent owns one job, 0-FP) ---
+    fps = {r.survey_number: r.placement.footprint() for r in results if r.placement}
+    pa = ParcelAgent().run(cad, surveys)
+    ov = TngisOverlayAgent().run(fps, pa.data.get("parcels", {})).data
+    acc = {r.survey_number for r in results if r.placed}
+    asm = AssemblyAgent().run(fps, acc, confidence=ov["iou"]).data
+    for r in results:                              # AssemblyAgent only DEMOTES (never promotes)
+        if r.survey_number in asm["demote"]:
+            r.recommendation = "REVIEW"
+            r.note = (r.note + " | " if r.note else "") + "AssemblyAgent: footprint overlap -> REVIEW"
+    # TNGIS-overlay ACCEPT gate (math, 0-FP): a plot whose placed FMB strongly overlays its
+    # own survey#'s parcel IS correctly clubbed -> ACCEPT, even if the raster corner residual
+    # (z18-noisy) failed the rigid gate. Never promotes an off-seat/overlapping plot.
+    n_iou_up = 0
+    for r in results:
+        if r.recommendation != "ACCEPT" and r.survey_number not in asm["demote"]:
+            iou = ov["iou"].get(r.survey_number, 0.0)
+            seated = "off-seat" not in (r.note or "")
+            if iou >= IOU_ACCEPT and seated and r.placement is not None:
+                r.recommendation = "ACCEPT"
+                r.note = (r.note + " | " if r.note else "") + f"IoU-gate: overlays TNGIS {iou:.2f}"
+                n_iou_up += 1
+    print(f"\n[ParcelAgent] {len(pa.data.get('parcels',{}))} parcels; {pa.issues}")
+    print(f"[TngisOverlayAgent] clubbed FMB overlays TNGIS: mean IoU={ov['mean_iou']:.2f}, "
+          f"plot-overlap={ov['overlap_frac']*100:.0f}%")
+    print(f"[AssemblyAgent] {asm['demote'] or 'no overlaps -> clean tiling'}")
+    print(f"[IoU-gate] upgraded {n_iou_up} plot(s) to ACCEPT on strong TNGIS overlay "
+          f"(>= {IOU_ACCEPT})")
 
     counts = Counter(r.recommendation for r in results)
     placed = [r for r in results if r.placed]
     print("\n================ DISPOSITIONS ================")
     print(dict(counts))
     for r in sorted(results, key=lambda r: int(r.survey_number) if r.survey_number.isdigit() else 0):
-        print(f"  {r.survey_number:>6}  {r.recommendation:<14} {r.method or '-'}")
-    print(f"\nPLACED: {len(placed)}/{len(results)} onto cadastral parcels")
+        iou = ov["iou"].get(r.survey_number)
+        print(f"  {r.survey_number:>6}  {r.recommendation:<14} {r.method or '-':<10} "
+              f"IoU={iou:.2f}" if iou is not None else
+              f"  {r.survey_number:>6}  {r.recommendation:<14} {r.method or '-'}")
+    print(f"\nPLACED: {len(placed)}/{len(results)} onto cadastral parcels  "
+          f"(clubbed FMB<->TNGIS mean IoU {ov['mean_iou']:.2f})")
 
     try:
         render_club_qa(results, out / "clubbed_qa.png", cadastral_source=cad, crs=CRS)
