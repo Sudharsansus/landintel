@@ -107,6 +107,15 @@ def main() -> None:
         render_club_qa(results, out / "clubbed_qa.png", cadastral_source=cad, crs=CRS)
     except Exception as exc:  # noqa: BLE001
         print(f"(qa render skipped: {exc})")
+
+    # FINAL DELIVERABLE: village area-statement PDF + Excel + clubbed DXF, zipped.
+    try:
+        from landintel.pipeline.m4_report.village import build_village_delivery
+        zip_path = build_village_delivery(results, out / "clubbed_village.dxf", out,
+                                          village=village, crs=CRS)
+        print(f"Deliverable : {zip_path}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"(delivery package skipped: {exc})")
     print(f"Clubbed DXF : {out / 'clubbed_village.dxf'}")
     print(f"Points CSV  : {out / 'clubbed_points.csv'}")
 
