@@ -373,6 +373,75 @@ def verify_m1_dxf(
                     "all dimension labels numeric" if not bad_dims
                     else f"{len(bad_dims)} non-numeric dim token(s): {bad_dims[:5]}"))
 
+    # --- 10. Topology: every stone lying ON a boundary edge must be a VERTEX -----
+    # Else the edge runs straight THROUGH the stone as one line (client: "the line is
+    # divided but shown as a single line -- join it at the point"). to_dxf splits edges
+    # at on-edge stones, so this should now pass; the check keeps it from regressing.
+    bnd_pls = [e for e in msp.query("LWPOLYLINE") if e.dxf.layer == LayerType.BOUNDARY.value]
+    bnd_edges, bnd_verts = [], set()
+    for e in bnd_pls:
+        pts = [(p[0], p[1]) for p in e.get_points()]
+        for p in pts:
+            bnd_verts.add((round(p[0], 1), round(p[1], 1)))
+        for i in range(len(pts) - 1):
+            bnd_edges.append((pts[i], pts[i + 1]))
+
+    def _pt_seg(px, py, ax, ay, bx, by):
+        dx, dy = bx - ax, by - ay
+        L2 = dx * dx + dy * dy
+        if L2 < 1e-9:
+            return math.hypot(px - ax, py - ay), 0.0
+        t = ((px - ax) * dx + (py - ay) * dy) / L2
+        tc = max(0.0, min(1.0, t))
+        return math.hypot(px - (ax + tc * dx), py - (ay + tc * dy)), t
+
+    thru = []
+    for s in stones:
+        sx, sy = s.dxf.insert.x, s.dxf.insert.y
+        if (round(sx, 1), round(sy, 1)) in bnd_verts:
+            continue
+        for (ax, ay), (bx, by) in bnd_edges:
+            d, t = _pt_seg(sx, sy, ax, ay, bx, by)
+            if d < 1.0 and 0.05 < t < 0.95:
+                thru.append(str(s.dxf.text).strip())
+                break
+    add(VerifyCheck("stones_are_boundary_vertices", not thru, "warn",
+                    "every on-edge stone is a boundary vertex" if not thru
+                    else f"{len(thru)} stone(s) sit mid-edge with no vertex (line runs "
+                         f"through): {thru[:5]}"))
+
+    # --- 11. Subdivision lines that stop just short of the boundary (attach gap) --
+    sub_pls = [e for e in msp.query("LWPOLYLINE")
+               if e.dxf.layer == LayerType.SUBDIVISION_LINES.value]
+    sub_eps = []
+    for e in sub_pls:
+        pts = [(p[0], p[1]) for p in e.get_points()]
+        if pts:
+            sub_eps.append(pts[0])
+            sub_eps.append(pts[-1])
+
+    def _deg(pt):
+        return sum(1 for q in sub_eps if math.hypot(pt[0] - q[0], pt[1] - q[1]) < 0.3)
+
+    detached = 0
+    for ep in sub_eps:
+        if _deg(ep) > 1:                       # shared with another subdivision -> interior node
+            continue
+        d = min((_pt_seg(ep[0], ep[1], a[0], a[1], b[0], b[1])[0]
+                 for a, b in bnd_edges), default=999.0)
+        if 0.1 < d < 8.0:                      # dangling end, short of the boundary
+            detached += 1
+    add(VerifyCheck("subdivisions_attached", detached == 0, "warn",
+                    "subdivision lines attach to boundary" if detached == 0
+                    else f"{detached} subdivision end(s) stop 0.1-8 m short of the boundary"))
+
+    # --- 12. Stone-number OCR recall (INFO/WARN): fraction of '?' synthetic labels --
+    n_syn = sum(1 for s in stones if str(s.dxf.text).strip().startswith("?"))
+    frac = n_syn / max(len(stones), 1)
+    add(VerifyCheck("stone_numbers_read", frac <= 0.5, "warn",
+                    f"{len(stones) - n_syn}/{len(stones)} stone numbers read by OCR "
+                    f"({frac * 100:.0f}% unread '?'); positions exact regardless"))
+
     return report
 
 

@@ -57,6 +57,10 @@ SEPARATION_LEN_M = 21.0
 # gap to close and snapped onto the boundary ring (client: "subdivision lines not
 # attached to boundary"). Small enough not to disturb genuine interior T-junctions.
 SUBDIV_SNAP_TOL_M = 3.0
+# A DANGLING subdivision end (an open end shared with no other subdivision segment) that
+# should reach the boundary but stops short is snapped within this larger tolerance --
+# only open ends move, so interior T-junctions (shared, degree >= 2) are never distorted.
+SUBDIV_DANGLE_TOL_M = 8.0
 
 # Endpoint coincidence tolerance (PDF points) when chaining an open boundary.
 _CHAIN_TOLERANCE = 0.5
@@ -730,27 +734,33 @@ def build_plot(
     _ring_m = [_transform(p, ppm, page_height) for p in ring_px] if len(ring_px) >= 2 else []
     _bnd_ring_m = Polygon(_ring_m).exterior if len(_ring_m) >= 4 else None
 
+    # Transform subdivision segments to metres first, then compute endpoint DEGREE (how
+    # many segment-ends coincide there) so a DANGLING open end (degree 1) can be attached
+    # with a wider reach than a shared interior node.
+    _sub_raw = [(_transform(s.start, ppm, page_height), _transform(s.end, ppm, page_height))
+                for s in vectors.internal]
+    _sub_eps = [ep for seg in _sub_raw for ep in seg]
+
+    def _sub_degree(pt: Point) -> int:
+        return sum(1 for q in _sub_eps if math.hypot(pt[0] - q[0], pt[1] - q[1]) < 0.3)
+
     def _snap_to_boundary(pt: Point) -> Point:
-        """Attach a subdivision endpoint to the boundary when it stops just short of it.
+        """Attach a subdivision endpoint to the boundary when it stops short of it.
         A subdivision line divides the parcel, so its ends lie ON the boundary; vector
-        extraction sometimes leaves a small gap (line not drawn quite to the edge). If an
-        endpoint is within SUBDIV_SNAP_TOL_M of the ring, snap it to the nearest ring
-        point. Genuinely-interior endpoints (T-junctions with other subdivisions, far from
-        the boundary) are beyond the tol and left untouched -- so this never distorts the
-        internal network, it only closes the boundary gap the client flagged."""
+        extraction sometimes leaves a gap. An endpoint within SUBDIV_SNAP_TOL_M snaps; a
+        DANGLING open end (shared with no other subdivision segment) snaps within the wider
+        SUBDIV_DANGLE_TOL_M -- so an open end reaches the boundary while interior T-junctions
+        (shared, degree >= 2) stay put and the internal network is never distorted."""
         if _bnd_ring_m is None:
             return pt
         p = ShapelyPoint(pt[0], pt[1])
-        if _bnd_ring_m.distance(p) <= SUBDIV_SNAP_TOL_M:
+        tol = SUBDIV_DANGLE_TOL_M if _sub_degree(pt) <= 1 else SUBDIV_SNAP_TOL_M
+        if _bnd_ring_m.distance(p) <= tol:
             proj = _bnd_ring_m.interpolate(_bnd_ring_m.project(p))
             return (proj.x, proj.y)
         return pt
 
-    subdivision_segments = [
-        (_snap_to_boundary(_transform(s.start, ppm, page_height)),
-         _snap_to_boundary(_transform(s.end, ppm, page_height)))
-        for s in vectors.internal
-    ]
+    subdivision_segments = [(_snap_to_boundary(a), _snap_to_boundary(b)) for a, b in _sub_raw]
     # Chain/traverse: keep only segments INSIDE the plot boundary.  The traverse
     # direction arrows (the ">>>" chevrons) and neighbour-connection legs sit
     # OUTSIDE the boundary — they are noise for a single-plot extraction.  An
