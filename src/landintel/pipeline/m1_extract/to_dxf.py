@@ -155,6 +155,45 @@ def _centroid(boundary: Boundary) -> Point:
     )
 
 
+def _split_edge_at_nodes(
+    a: Point, b: Point, nodes: list[Point], tol: float = 1.5,
+) -> list[tuple[Point, Point]]:
+    """Split boundary edge a-b at any node (stone / subdivision junction) lying ON it.
+
+    A stone that sits mid-edge should be a real vertex so the boundary is DIVIDED at
+    that point (two segments meeting at the stone) instead of one line running straight
+    through it. Returns ordered sub-segments; the split vertex is the node itself (the
+    surveyor's true boundary point), so the boundary snaps onto the stone. Nodes off the
+    edge (perp dist > tol) or at the endpoints are ignored -> no shape change elsewhere.
+    """
+    import math
+    ax, ay = a
+    bx, by = b
+    dx, dy = bx - ax, by - ay
+    L2 = dx * dx + dy * dy
+    if L2 < 1e-9:
+        return [(a, b)]
+    hits: list[tuple[float, Point]] = []
+    for nx, ny in nodes:
+        t = ((nx - ax) * dx + (ny - ay) * dy) / L2
+        if not (0.02 < t < 0.98):
+            continue
+        px, py = ax + t * dx, ay + t * dy
+        if math.hypot(nx - px, ny - py) <= tol:
+            hits.append((t, (nx, ny)))
+    if not hits:
+        return [(a, b)]
+    hits.sort(key=lambda h: h[0])
+    verts: list[Point] = [a]
+    last_t = 0.0
+    for t, p in hits:
+        if t - last_t > 0.01:
+            verts.append(p)
+            last_t = t
+    verts.append(b)
+    return [(verts[i], verts[i + 1]) for i in range(len(verts) - 1)]
+
+
 def _dot_to_comma(text: str) -> str:
     """Replace decimal dot with comma (44.2 -> 44,2) as per client convention."""
     return text.replace(".", ",")
@@ -260,11 +299,18 @@ def build_document(plot: Plot) -> Drawing:
     for start, end in plot.separation_segments:
         _add_seg(start, end, LayerType.SEPARATION_LINE.value)
 
-    # Boundary — one LWPOLYLINE per edge, red.
+    # Boundary — one LWPOLYLINE per edge, red. A boundary edge is SPLIT at any stone
+    # (or subdivision T-junction) lying on it, so a stone that sits mid-edge becomes a
+    # real vertex/node instead of the edge running straight THROUGH it as one line
+    # (client: "the line is divided but shown as a single line -- join it at the point").
     if plot.boundary is not None and plot.boundary.points:
         pts = plot.boundary.points
+        _nodes = [(c.x, c.y) for c in plot.corner_points]
+        for seg in plot.subdivision_segments:            # subdivision ends that touch the boundary
+            _nodes.append(seg[0]); _nodes.append(seg[1])
         for i in range(len(pts) - 1):
-            _add_seg(pts[i], pts[i + 1], LayerType.BOUNDARY.value)
+            for a, b in _split_edge_at_nodes(pts[i], pts[i + 1], _nodes):
+                _add_seg(a, b, LayerType.BOUNDARY.value)
 
     # Corner stones — TEXT only (manual reference has TEXT entities only here).
     # Justify = LEFT (halign=Left, valign=Baseline): the TEXT insertion point
