@@ -12,6 +12,7 @@ from landintel.pipeline.m2_club.agents import (
     AssemblyAgent,
     ParcelAgent,
     TngisOverlayAgent,
+    overlay_gate,
 )
 
 
@@ -85,3 +86,50 @@ def test_assembly_keeps_a_clean_tiling():
     r = AssemblyAgent().run(fp, accepted={"1", "2"}, confidence={"1": 0.9, "2": 0.9})
     assert r.data["demote"] == set()
     assert r.data["accept"] == {"1", "2"}
+
+
+# --------------------------------------------------------------------------- overlay_gate (0-FP)
+def _gate(rec, iou, **kw):
+    kw.setdefault("seated", True)
+    kw.setdefault("has_placement", True)
+    kw.setdefault("in_demote", False)
+    kw.setdefault("is_vector_parcel", True)
+    kw.setdefault("contested", False)
+    return overlay_gate(rec, iou, **kw)
+
+
+def test_gate_strong_overlay_promotes_even_when_off_seat():
+    # 47-like: high IoU on its OWN uncontested vector parcel, but flagged off-seat -> ACCEPT.
+    rec, reason = _gate("REVIEW", 0.73, seated=False)
+    assert rec == "ACCEPT" and "strong" in reason
+
+
+def test_gate_seated_path_unchanged():
+    rec, _ = _gate("REVIEW", 0.55, seated=True)          # original path still promotes
+    assert rec == "ACCEPT"
+
+
+def test_gate_strong_needs_uncontested_vector_parcel():
+    # contested label (a mislabel collision) blocks the strong path -> stays REVIEW.
+    assert _gate("REVIEW", 0.73, seated=False, contested=True)[0] == "REVIEW"
+    # non-vector (label-point box) parcel is not strong-eligible either.
+    assert _gate("REVIEW", 0.73, seated=False, is_vector_parcel=False)[0] == "REVIEW"
+
+
+def test_gate_never_promotes_low_iou_or_off_seat_only():
+    assert _gate("REVIEW", 0.30, seated=True)[0] == "REVIEW"           # too low
+    assert _gate("REVIEW", 0.55, seated=False)[0] == "REVIEW"          # seated path needs seated
+    assert _gate("REVIEW", 0.90, in_demote=True)[0] == "REVIEW"        # overlap-demoted stays
+    assert _gate("REVIEW", 0.90, has_placement=False)[0] == "REVIEW"   # no placement
+
+
+def test_gate_demotes_self_contradicting_accept():
+    # 141-like: ACCEPT but ~0 overlap with its OWN real vector parcel -> REVIEW.
+    rec, reason = _gate("ACCEPT", 0.00)
+    assert rec == "REVIEW" and "contradiction" in reason
+
+
+def test_gate_keeps_good_accept_and_ignores_boxed_parcel():
+    assert _gate("ACCEPT", 0.80)[0] == "ACCEPT"                        # good ACCEPT kept
+    # a boxed (non-vector) parcel with low IoU is NOT demoted (no trustworthy geometry).
+    assert _gate("ACCEPT", 0.00, is_vector_parcel=False)[0] == "ACCEPT"

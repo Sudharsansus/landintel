@@ -1073,6 +1073,10 @@ class S3CadastralSource(CadastralSource):
         # pipeline tries each against its rigid gate and keeps the first that passes
         # (so a recovered ring can never become a false ACCEPT the gate would reject).
         self._candidates: dict[str, list[CadastralParcel]] = {}
+        # Surveys whose parcel came from a REAL vector ring (clean enclosing polygon or a
+        # recovered closed ring) -- as opposed to the label-point fallback box. Only these
+        # carry a trustworthy geometry to gate a placement's IoU against (see run_m2_cad).
+        self._vector_surveys: set[str] = set()
         n_merged = 0
         n_recovered = 0
         for sn, (ux, uy) in self._labels.items():
@@ -1081,6 +1085,7 @@ class S3CadastralSource(CadastralSource):
                          if p.contains(pt) and p.area <= max_single_area]
             if enclosing:
                 poly = min(enclosing, key=lambda p: p.area)
+                self._vector_surveys.add(sn)
             else:
                 # No clean right-sized ring (merged/missing). Try a LOCAL, label-seeded
                 # recovery of the parcel's own yellow ring (bridges its raster gaps
@@ -1110,6 +1115,7 @@ class S3CadastralSource(CadastralSource):
                                         source_crs=crs)
                         for c in sorted(cands, key=lambda p: p.area, reverse=True)]
                     poly = max(cands, key=lambda p: p.area)
+                    self._vector_surveys.add(sn)
                     n_recovered += 1
                     _log.info("S3: recovered open parcel %s by local yellow-gap bridge "
                               "(%d candidate ring(s), best area=%.0f m2)",
@@ -1146,6 +1152,12 @@ class S3CadastralSource(CadastralSource):
 
     def label_point(self, survey_number: str) -> tuple[float, float] | None:
         return self._labels.get(_norm_survey(survey_number) or survey_number)
+
+    def is_vector_parcel(self, survey_number: str) -> bool:
+        """True iff this survey's parcel is a REAL vectorised ring (clean enclosing polygon
+        or a recovered closed ring), not the 25 m label-point fallback box. Only a vector
+        parcel carries trustworthy geometry to gate a placement's IoU against."""
+        return (_norm_survey(survey_number) or survey_number) in self._vector_surveys
 
     def survey_numbers(self) -> set[str]:
         return set(self._by_survey)

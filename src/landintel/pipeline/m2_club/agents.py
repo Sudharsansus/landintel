@@ -24,6 +24,42 @@ from shapely.geometry import Polygon
 from shapely.ops import unary_union
 
 
+def overlay_gate(recommendation: str, iou: float | None, *,
+                 seated: bool, has_placement: bool, in_demote: bool,
+                 is_vector_parcel: bool, contested: bool,
+                 iou_accept: float = 0.5, iou_strong: float = 0.6,
+                 iou_contradict: float = 0.15) -> tuple[str, str | None]:
+    """0-FP TNGIS-overlay disposition for ONE plot. Pure + testable; returns
+    ``(recommendation, reason)``. This is the single arbiter used by run_m2_cad so the
+    false-positive discipline is locked by tests rather than living inline in a script.
+
+    Rules (a plot's overlay IoU is against its OWN survey#'s parcel):
+      * DEMOTE  ACCEPT -> REVIEW  when the parcel is a REAL vector ring but IoU < iou_contradict
+        (self-contradiction: placed away from the parcel carrying its number, e.g. a mislabel).
+      * PROMOTE non-ACCEPT -> ACCEPT (only if it has a placement and was not demoted for overlap)
+        when EITHER
+          STRONG: IoU >= iou_strong AND parcel is a real vector ring AND label uncontested, OR
+          SEATED: IoU >= iou_accept AND not flagged off-seat.
+      * otherwise unchanged.
+
+    0-FP: promotion needs genuine overlap with the plot's OWN parcel; the STRONG path additionally
+    requires an uncontested vector parcel, closing the only blind spot IoU cannot see (a
+    mislabelled-but-congruent parcel). Demotion only ever REMOVES an ACCEPT."""
+    if recommendation == "ACCEPT":
+        if is_vector_parcel and iou is not None and iou < iou_contradict:
+            return "REVIEW", f"IoU-contradiction {iou:.2f} vs own parcel"
+        return "ACCEPT", None
+    if in_demote or not has_placement:
+        return recommendation, None
+    v = iou or 0.0
+    strong = (v >= iou_strong and is_vector_parcel and not contested)
+    seated_ok = (v >= iou_accept and seated)
+    if strong or seated_ok:
+        tag = "strong/uncontested overlay" if (strong and not seated_ok) else "overlays TNGIS"
+        return "ACCEPT", f"IoU-gate: {tag} {v:.2f}"
+    return recommendation, None
+
+
 @dataclass
 class AgentResult:
     """Uniform hand-off: what the agent produced, whether its own check passed, a 0-1

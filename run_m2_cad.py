@@ -25,9 +25,15 @@ sys.path.insert(0, "src")
 sys.stdout.reconfigure(encoding="utf-8")
 
 from pyproj import Transformer
+from shapely.geometry import Point
 
 from landintel.pipeline.m2_club import club_pipeline
-from landintel.pipeline.m2_club.agents import AssemblyAgent, ParcelAgent, TngisOverlayAgent
+from landintel.pipeline.m2_club.agents import (
+    AssemblyAgent,
+    ParcelAgent,
+    TngisOverlayAgent,
+    overlay_gate,
+)
 from landintel.pipeline.m2_club.club_output import snap_and_rewrite
 from landintel.pipeline.m2_club.qa_render import render_club_qa
 from landintel.pipeline.m5_cadastral.s3_tiles import TILE_VARIANT, S3CadastralSource
@@ -39,12 +45,23 @@ CRS = "EPSG:32643"           # UTM 43N -- all these Erode villages are west of 7
 # it scores low. A plot is ACCEPTed when its overlay is strong AND it sits on its own label
 # point (seat-locality already enforced upstream). General threshold; override via env.
 IOU_ACCEPT = float(os.environ.get("LANDINTEL_IOU_ACCEPT", "0.5"))
+# STRONG-overlay ACCEPT: a placed FMB that overlaps its OWN survey#'s REAL vector parcel by
+# >= this fraction is seated on that parcel more reliably than any label-point-distance proxy
+# (IoU integrates the whole footprint). It supersedes the "off-seat" veto (which mis-fires on
+# benign label-vs-centroid offset), GATED by label provenance (parcel must be uncontested) so a
+# mislabelled parcel can never earn ACCEPT. 0-FP: a geometrically wrong placement scores low.
+IOU_STRONG = float(os.environ.get("LANDINTEL_IOU_STRONG", "0.6"))
+# IoU-contradiction demote: an ACCEPT whose placement barely overlaps its own REAL vector parcel
+# is self-contradictory (e.g. an OCR mislabel placed it away from the parcel carrying its number,
+# like NASIYANUR 141). Demote to REVIEW -- a TIGHTENING of the FP gate, never a new ACCEPT.
+IOU_CONTRADICT = float(os.environ.get("LANDINTEL_IOU_CONTRADICT", "0.15"))
 
 
 def _args() -> tuple[str, float, float, float]:
     a = sys.argv[1:]
     village = a[0]
-    opt = {"radius_km": 2.5, "cx": None, "cy": None, "taluk": "", "district": ""}
+    opt = {"radius_km": 2.5, "cx": None, "cy": None, "taluk": "", "district": "",
+           "vector": ("--vector" in a) or os.environ.get("LANDINTEL_CADASTRAL") == "vector"}
     if "--radius-km" in a:
         opt["radius_km"] = float(a[a.index("--radius-km") + 1])
     if "--taluk" in a:
@@ -89,45 +106,67 @@ def main() -> None:
     # A provided --lat/--lon or --utm is used as the WEB ANCHOR for the density-peak locator
     # (NOT a fixed bbox): a coarse web/pincode/Nominatim centroid pins WHERE to look; the
     # survey-number density-peak + FMB-shape IoU still refine WHICH block is really ours.
-    from landintel.pipeline.m5_cadastral.geo_locate import locate_village
     anchor_ll = None
     if opt["cx"] is not None:
         _lon, _lat = Transformer.from_crs(CRS, "EPSG:4326", always_xy=True).transform(
             opt["cx"], opt["cy"])
         anchor_ll = (_lat, _lon)
-        print(f"[2/4] web anchor UTM43 ({opt['cx']:.0f},{opt['cy']:.0f}) "
-              f"-> density-peak + IoU refine")
+        print(f"[2/4] web anchor UTM43 ({opt['cx']:.0f},{opt['cy']:.0f})"
+              f"{' -> VECTOR cadastre' if opt['vector'] else ' -> density-peak + IoU refine'}")
     else:
         print(f"[2/4] auto-locating {village} by geocode + Qwen + survey-number fingerprint...")
-    taluk = opt["taluk"] or _taluk_district(m1_paths, village)[0]
-    district = opt["district"] or _taluk_district(m1_paths, village)[1]
-    candidates, info = locate_village(village, surveys, CRS, cache_dir,
-                                      taluk=taluk, district=district, anchor_latlon=anchor_ll)
-    print(f"      anchor={info.get('anchor_level')} @ {info.get('anchor_latlon')} | "
-          f"{info.get('n_candidates')} candidate village block(s) sharing these survey "
-          f"numbers, centers={info.get('candidate_centers')}")
-    if not candidates:
-        raise SystemExit(f"could not locate any cadastral block for {village}")
 
-    # DISAMBIGUATE by FMB-SHAPE AGREEMENT: TN villages all number parcels 1..N, so the same
-    # survey numbers recur in every neighbour -> several candidate blocks. The REAL village is
-    # the block where the FMB boundary shapes actually fit its parcels. Place into each block
-    # and keep the one with the most ACCEPTs (0-FP shape gate decides fit); ties -> more placed.
-    MAX_EVAL = 5                                        # cap disambiguation cost (top blocks)
-    eval_cands = candidates[:MAX_EVAL]
-    print(f"[3/4] fetching + OCR-ing cadastral tiles for {len(eval_cands)} candidate block(s) "
-          f"(of {len(candidates)}); picking the block the FMB shapes fit...")
-    from landintel.pipeline.m5_cadastral.s3_tiles import _default_engine
-    engine = _default_engine()                         # build ONE OCR engine, reuse per block
+    MAX_EVAL = 6                                        # cap disambiguation cost (top candidates)
+    engine = None
+    if opt["vector"]:
+        # EXACT vector-cadastre path (TNGIS statewide parcels): no tiles, no OCR. Candidate
+        # villages = lgd_village_codes near the anchor carrying the FMB survey numbers; the same
+        # FMB-shape IoU disambiguation below picks the real one (village code never hardcoded).
+        if anchor_ll is None:
+            raise SystemExit("vector mode needs a --lat/--lon (or --utm) anchor")
+        from landintel.pipeline.m5_cadastral.vector_locate import (
+            load_area_parcels_cached, village_candidates)
+        parcels = load_area_parcels_cached(
+            anchor_ll, cache_json=f"data/tngis/area_{village}.json")
+        eval_cands = village_candidates(parcels, surveys, (opt["cx"], opt["cy"]),
+                                        radius_m=5000.0, min_overlap=3, max_cand=MAX_EVAL, crs=CRS)
+        if not eval_cands:
+            raise SystemExit(f"no vector cadastral village near anchor for {village}")
+        print(f"      {len(eval_cands)} candidate village(s) (lgd_village_code) near anchor "
+              f"carrying the FMB surveys; picking the one the FMB shapes fit...")
+        print(f"[3/4] matching FMB shapes against EXACT vector parcels of "
+              f"{len(eval_cands)} candidate village(s)...")
+    else:
+        from landintel.pipeline.m5_cadastral.geo_locate import locate_village
+        taluk = opt["taluk"] or _taluk_district(m1_paths, village)[0]
+        district = opt["district"] or _taluk_district(m1_paths, village)[1]
+        candidates, info = locate_village(village, surveys, CRS, cache_dir,
+                                          taluk=taluk, district=district, anchor_latlon=anchor_ll)
+        print(f"      anchor={info.get('anchor_level')} @ {info.get('anchor_latlon')} | "
+              f"{info.get('n_candidates')} candidate village block(s) sharing these survey "
+              f"numbers, centers={info.get('candidate_centers')}")
+        if not candidates:
+            raise SystemExit(f"could not locate any cadastral block for {village}")
+        eval_cands = candidates[:MAX_EVAL]
+        print(f"[3/4] fetching + OCR-ing cadastral tiles for {len(eval_cands)} candidate "
+              f"block(s) (of {len(candidates)}); picking the block the FMB shapes fit...")
+        from landintel.pipeline.m5_cadastral.s3_tiles import _default_engine
+        engine = _default_engine()                     # build ONE OCR engine, reuse per block
+
     best = None
     for i, cand in enumerate(eval_cands):
-        tag = f"block {i+1}/{len(eval_cands)} @ {cand.get('center')} ({cand['n']} surveys)"
+        n_sv = cand.get("n_overlap", cand.get("n", len(surveys)))
+        label = f"village vc={cand['vc']}" if opt["vector"] else "block"
+        tag = f"{label} {i+1}/{len(eval_cands)} @ {cand.get('center')} ({n_sv} surveys)"
         try:
-            # use_label_cache=False: candidates share the survey set, so the on-disk label
-            # cache would collide between blocks -- re-OCR each fenced block (small, fast).
-            cad_i = S3CadastralSource(cand["bbox"], surveys, cache_dir=cache_dir, crs=CRS,
-                                      village_fence=cand["fence"], engine=engine,
-                                      use_label_cache=False)
+            if opt["vector"]:
+                cad_i = cand["source"]                  # exact vector parcels, prebuilt
+            else:
+                # use_label_cache=False: candidates share the survey set, so the on-disk label
+                # cache would collide between blocks -- re-OCR each fenced block (small, fast).
+                cad_i = S3CadastralSource(cand["bbox"], surveys, cache_dir=cache_dir, crs=CRS,
+                                          village_fence=cand["fence"], engine=engine,
+                                          use_label_cache=False)
             res_i = club_pipeline(m1_paths, out, crs=CRS, cadastral_source=cad_i)
         except Exception as exc:  # noqa: BLE001
             print(f"      {tag}: FAILED ({exc})")
@@ -166,24 +205,54 @@ def main() -> None:
         if r.survey_number in asm["demote"]:
             r.recommendation = "REVIEW"
             r.note = (r.note + " | " if r.note else "") + "AssemblyAgent: footprint overlap -> REVIEW"
-    # TNGIS-overlay ACCEPT gate (math, 0-FP): a plot whose placed FMB strongly overlays its
-    # own survey#'s parcel IS correctly clubbed -> ACCEPT, even if the raster corner residual
-    # (z18-noisy) failed the rigid gate. Never promotes an off-seat/overlapping plot.
-    n_iou_up = 0
+    # Label provenance guard: a parcel is CONTESTED if another survey's OCR label also lies
+    # inside it (a duplicate-number / mislabel collision). The strong-overlay ACCEPT path below
+    # trusts a high IoU only when the parcel is uncontested, so a wrong-but-congruent parcel that
+    # OCR mislabelled with this survey# can never earn ACCEPT (this is the only FP path IoU alone
+    # cannot see). Computed from the public label points + parcels -> no OCR-internal coupling.
+    parcels = pa.data.get("parcels", {})
+    label_pts = {sv: cad.label_point(sv) for sv in surveys}
+    label_pts = {sv: p for sv, p in label_pts.items() if p is not None}
+
+    def _contested(sv: str) -> bool:
+        par = parcels.get(sv)
+        if par is None:
+            return True                       # no parcel -> cannot verify -> not strong-eligible
+        for other, pt in label_pts.items():
+            if other != sv and par.contains(Point(*pt)):
+                return True
+        return False
+
+    # TNGIS-overlay disposition (math, 0-FP) via the single tested arbiter overlay_gate:
+    # promotes a strongly/seated overlaying plot to ACCEPT, demotes a self-contradicting ACCEPT
+    # to REVIEW. See overlay_gate for the exact 0-FP rules.
+    n_iou_up = n_contra = 0
     for r in results:
-        if r.recommendation != "ACCEPT" and r.survey_number not in asm["demote"]:
-            iou = ov["iou"].get(r.survey_number, 0.0)
-            seated = "off-seat" not in (r.note or "")
-            if iou >= IOU_ACCEPT and seated and r.placement is not None:
-                r.recommendation = "ACCEPT"
-                r.note = (r.note + " | " if r.note else "") + f"IoU-gate: overlays TNGIS {iou:.2f}"
+        sv = r.survey_number
+        before = r.recommendation
+        new_rec, reason = overlay_gate(
+            before, ov["iou"].get(sv),
+            seated="off-seat" not in (r.note or ""),
+            has_placement=r.placement is not None,
+            in_demote=sv in asm["demote"],
+            is_vector_parcel=cad.is_vector_parcel(sv),
+            contested=_contested(sv),
+            iou_accept=IOU_ACCEPT, iou_strong=IOU_STRONG, iou_contradict=IOU_CONTRADICT)
+        if new_rec != before:
+            r.recommendation = new_rec
+            if reason:
+                r.note = (r.note + " | " if r.note else "") + reason
+            if new_rec == "ACCEPT":
                 n_iou_up += 1
+            elif before == "ACCEPT":
+                n_contra += 1
     print(f"\n[ParcelAgent] {len(pa.data.get('parcels',{}))} parcels; {pa.issues}")
     print(f"[TngisOverlayAgent] clubbed FMB overlays TNGIS: mean IoU={ov['mean_iou']:.2f}, "
           f"plot-overlap={ov['overlap_frac']*100:.0f}%")
     print(f"[AssemblyAgent] {asm['demote'] or 'no overlaps -> clean tiling'}")
-    print(f"[IoU-gate] upgraded {n_iou_up} plot(s) to ACCEPT on strong TNGIS overlay "
-          f"(>= {IOU_ACCEPT})")
+    print(f"[IoU-gate] upgraded {n_iou_up} plot(s) to ACCEPT on TNGIS overlay "
+          f"(strong>={IOU_STRONG} uncontested, or seated>={IOU_ACCEPT}); "
+          f"demoted {n_contra} self-contradicting ACCEPT(s) (IoU<{IOU_CONTRADICT}) to REVIEW")
 
     counts = Counter(r.recommendation for r in results)
     placed = [r for r in results if r.placed]

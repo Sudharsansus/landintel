@@ -45,3 +45,4 @@ reference/Sreeragu-FMBtoDXF-sreeragu-dev/
 # cadastral tile caches (variant-named) + pipeline outputs (regenerated)
 input/*/s3_*/
 output/
+data/tngis/
