@@ -76,7 +76,13 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
 
     m1_paths = sorted(str(p) for p in m1_dir.glob(f"{village}_*.dxf"))
-    surveys = {m.group(1) for p in m1_paths if (m := re.search(r"_(\d+)\.dxf$", p))}
+    # Survey number = the FMB number in the filename. Tolerate BOTH naming conventions seen in
+    # client inputs -- "<village>_..._<n>.dxf" AND "<village>_<n> KDM.dxf" (digits followed by a
+    # free-text suffix). General: the FMB number is the LAST digit-run in the stem.
+    def _survey_of(p: str) -> str | None:
+        nums = re.findall(r"\d+", Path(p).stem)
+        return nums[-1] if nums else None
+    surveys = {s for p in m1_paths if (s := _survey_of(p))}
     cache_dir = f"input/{village}/s3_{TILE_VARIANT}"      # variant-specific (tiles + caches)
     print(f"[1/4] {village}: {len(m1_paths)} M1 FMBs, surveys {sorted(surveys, key=int)}")
 
