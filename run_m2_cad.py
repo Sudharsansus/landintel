@@ -36,35 +36,60 @@ CRS = "EPSG:32643"           # UTM 43N -- all these Erode villages are west of 7
 def _args() -> tuple[str, float, float, float]:
     a = sys.argv[1:]
     village = a[0]
-    radius_km = 2.5
+    opt = {"radius_km": 2.5, "cx": None, "cy": None, "taluk": "", "district": ""}
     if "--radius-km" in a:
-        radius_km = float(a[a.index("--radius-km") + 1])
+        opt["radius_km"] = float(a[a.index("--radius-km") + 1])
+    if "--taluk" in a:
+        opt["taluk"] = a[a.index("--taluk") + 1]
+    if "--district" in a:
+        opt["district"] = a[a.index("--district") + 1]
     if "--utm" in a:
-        i = a.index("--utm")
-        cx, cy = float(a[i + 1]), float(a[i + 2])
+        i = a.index("--utm"); opt["cx"], opt["cy"] = float(a[i + 1]), float(a[i + 2])
     elif "--lat" in a and "--lon" in a:
         lat = float(a[a.index("--lat") + 1]); lon = float(a[a.index("--lon") + 1])
-        cx, cy = Transformer.from_crs("EPSG:4326", CRS, always_xy=True).transform(lon, lat)
-    else:
-        raise SystemExit("need --lat/--lon or --utm centre")
-    return village, cx, cy, radius_km * 1000.0
+        opt["cx"], opt["cy"] = Transformer.from_crs(
+            "EPSG:4326", CRS, always_xy=True).transform(lon, lat)
+    return village, opt
+
+
+def _taluk_district(m1_paths: list[str], village: str) -> tuple[str, str]:
+    """Parse taluk + district from an FMB filename (FMB_<DIST>_<TALUK>_<VILLAGE>_<n>)."""
+    for p in m1_paths:
+        m = re.search(r"FMB_([A-Za-z.]+)_([A-Za-z.]+)_", Path(p).name)
+        if m:
+            return m.group(2).strip("."), m.group(1).strip(".")
+    return "", "Erode"     # sensible default for this delivery region
 
 
 def main() -> None:
-    village, cx, cy, R = _args()
+    village, opt = _args()
     m1_dir = Path(f"output/{village}/m1")
     out = Path(f"output/{village}/m2")
     out.mkdir(parents=True, exist_ok=True)
 
     m1_paths = sorted(str(p) for p in m1_dir.glob(f"{village}_*.dxf"))
     surveys = {m.group(1) for p in m1_paths if (m := re.search(r"_(\d+)\.dxf$", p))}
-    bbox = (cx - R, cy - R, cx + R, cy + R)
+    cache_dir = f"input/{village}/s3_tiles"
     print(f"[1/4] {village}: {len(m1_paths)} M1 FMBs, surveys {sorted(surveys, key=int)}")
-    print(f"[2/4] centre UTM43 ({cx:.0f},{cy:.0f}) +/- {R/1000:.1f} km -> bbox "
-          f"{tuple(round(b) for b in bbox)}")
+
+    if opt["cx"] is not None:                          # explicit centre supplied
+        R = opt["radius_km"] * 1000.0
+        bbox = (opt["cx"] - R, opt["cy"] - R, opt["cx"] + R, opt["cy"] + R)
+        print(f"[2/4] centre UTM43 ({opt['cx']:.0f},{opt['cy']:.0f}) +/- {R/1000:.1f} km")
+    else:                                              # AUTO-LOCATE (general, no hardcoding)
+        from landintel.pipeline.m5_cadastral.geo_locate import locate_village
+        taluk = opt["taluk"] or _taluk_district(m1_paths, village)[0]
+        district = opt["district"] or _taluk_district(m1_paths, village)[1]
+        print(f"[2/4] auto-locating {village} (taluk={taluk}, district={district}) by "
+              f"geocode + Qwen + survey-number fingerprint...")
+        bbox, info = locate_village(village, surveys, CRS, cache_dir,
+                                    taluk=taluk, district=district)
+        print(f"      anchor={info.get('anchor_level')} @ {info.get('anchor_latlon')} | "
+              f"survey-hits={info.get('n_hits')} ({'tight' if info.get('tight') else 'wide'}) "
+              f"bbox={tuple(round(b) for b in bbox)}")
 
     print("[3/4] fetching + OCR-ing public cadastral tiles (mypropertyqr, no auth)...")
-    cad = S3CadastralSource(bbox, surveys, cache_dir=f"input/{village}/s3_tiles", crs=CRS)
+    cad = S3CadastralSource(bbox, surveys, cache_dir=cache_dir, crs=CRS)
 
     results = club_pipeline(m1_paths, out, crs=CRS, cadastral_source=cad)
     print("[4/4] quality pass: edge-align + corner-snap (0-FP)...")
