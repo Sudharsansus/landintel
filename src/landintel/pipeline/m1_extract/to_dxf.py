@@ -178,6 +178,11 @@ def _split_edge_at_nodes(
         t = ((nx - ax) * dx + (ny - ay) * dy) / L2
         if not (0.02 < t < 0.98):
             continue
+        # ABSOLUTE endpoint guard: a node within 1 m of either endpoint IS that corner --
+        # splitting there inserts the node into BOTH adjacent edges and creates a reversed
+        # duplicate sub-segment (MOOLAKARAI _18, caught by no_duplicate_boundary).
+        if math.hypot(nx - ax, ny - ay) < 1.0 or math.hypot(nx - bx, ny - by) < 1.0:
+            continue
         px, py = ax + t * dx, ay + t * dy
         if math.hypot(nx - px, ny - py) <= tol:
             hits.append((t, (nx, ny)))
@@ -185,11 +190,15 @@ def _split_edge_at_nodes(
         return [(a, b)]
     hits.sort(key=lambda h: h[0])
     verts: list[Point] = [a]
-    last_t = 0.0
-    for t, p in hits:
-        if t - last_t > 0.01:
+    for _t, p in hits:
+        # Dedup by ABSOLUTE spacing (0.3 m), not by t-fraction: a t-based guard is
+        # relative to edge length, so on a ~160 m edge it swallowed any second node
+        # within ~1.6 m and a real stone next to a subdivision junction lost its
+        # vertex (NASIYANUR ?44, caught by the verification agent).
+        if math.hypot(p[0] - verts[-1][0], p[1] - verts[-1][1]) > 0.3:
             verts.append(p)
-            last_t = t
+    if math.hypot(b[0] - verts[-1][0], b[1] - verts[-1][1]) < 0.3 and len(verts) > 1:
+        verts.pop()                       # last split point ~coincides with the endpoint
     verts.append(b)
     return [(verts[i], verts[i + 1]) for i in range(len(verts) - 1)]
 
@@ -308,8 +317,18 @@ def build_document(plot: Plot) -> Drawing:
         _nodes = [(c.x, c.y) for c in plot.corner_points]
         for seg in plot.subdivision_segments:            # subdivision ends that touch the boundary
             _nodes.append(seg[0]); _nodes.append(seg[1])
+        # DEDUP: a node shared by two adjacent edges can be split into both, emitting a
+        # reversed/overlapping short segment (no_duplicate_boundary FAIL, e.g. MOOLAKARAI
+        # _18). Track written edges by direction-independent rounded endpoints and skip
+        # degenerate (zero-length) or already-written edges.
+        _written: set = set()
         for i in range(len(pts) - 1):
             for a, b in _split_edge_at_nodes(pts[i], pts[i + 1], _nodes):
+                key = frozenset({(round(a[0], 2), round(a[1], 2)),
+                                 (round(b[0], 2), round(b[1], 2))})
+                if len(key) < 2 or key in _written:
+                    continue
+                _written.add(key)
                 _add_seg(a, b, LayerType.BOUNDARY.value)
 
     # Corner stones — TEXT only (manual reference has TEXT entities only here).
