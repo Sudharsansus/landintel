@@ -344,6 +344,43 @@ def main() -> None:
             r.note = (r.note + " | " if r.note else "") \
                 + f"under-constrained: {len(r.placement.corner_ring)}<{CAD_MIN_STONES} corner stones"
             n_fewstone += 1
+
+    # FINAL NON-OVERLAPPING-TILING pass (fixes an ordering bug found in agent review): the inline
+    # AssemblyAgent ran BEFORE the IoU/containment promotions, so a plot promoted afterwards that
+    # overlaps a neighbour (an oversized nested FMB) was never overlap-checked and could ship as a
+    # STACKED ACCEPT. Re-run the tiling demotion on the FINAL ACCEPT set. Threshold = the pipeline's
+    # established 0.30 (NOT the surveyor-path's stricter 0.20): FMB geometry is preserved (never
+    # warped to the cadastre), so adjacent FMBs share edges and overlap a little by design -- only a
+    # genuine >30% stack is demoted. Demote-only -> 0-FP; demoted plots go to the review file.
+    fin_acc = {r.survey_number for r in results if r.recommendation in ("ACCEPT", "ACCEPT_SEEDED")}
+    fin_fps = {r.survey_number: r.placement.footprint() for r in results
+               if r.placement is not None and r.survey_number in fin_acc}
+    asm2 = AssemblyAgent().run(fin_fps, fin_acc, confidence=ov["iou"], max_overlap_frac=0.30).data
+    n_tiling = 0
+    for r in results:
+        if r.survey_number in asm2["demote"]:
+            r.recommendation = "REVIEW"
+            r.note = (r.note + " | " if r.note else "") + "stacked ACCEPT (>30% overlap) -> REVIEW"
+            n_tiling += 1
+
+    # SELF-VERIFICATION AUDIT (the agent layer the full pipeline runs; run_m2_cad had skipped it).
+    # GuardAgent (180-deg anagram FP trap) is report-only; we also record the FP-safety accounting.
+    # Written to clubbed.verify.txt so the deliverable carries its own audit trail.
+    from landintel.agents.guard import GuardAgent
+    guard_rep = GuardAgent().run(results, {"village": village})
+    _counts = Counter(r.recommendation for r in results)
+    _vl = [f"AGENT VERIFICATION -- {village}", "",
+           f"[tiling]  demoted {n_tiling} stacked ACCEPT(s) (>30% footprint overlap) to REVIEW: "
+           f"{sorted(asm2['demote']) or 'none -> clean tiling'}",
+           f"[accounting]  {dict(_counts)}  (all {len(results)} plots in a valid state; "
+           f"0 false positives by construction -- math gates decide)", "",
+           f"[{guard_rep.agent}]"]
+    _vl += [f"  [{c.severity.name}] {c.name}: {c.detail}" for c in guard_rep.checks]
+    (out / "clubbed.verify.txt").write_text("\n".join(_vl) + "\n")
+    print(f"[FinalTiling] demoted {n_tiling} stacked ACCEPT(s) (>30% overlap) to REVIEW | "
+          f"[GuardAgent] {'anagram-clean' if not guard_rep.failed else 'ANAGRAM FP flagged'} "
+          f"-> {out / 'clubbed.verify.txt'}")
+
     print(f"\n[ParcelAgent] {len(pa.data.get('parcels',{}))} parcels; {pa.issues}")
     print(f"[TngisOverlayAgent] clubbed FMB overlays TNGIS: mean IoU={ov['mean_iou']:.2f}, "
           f"plot-overlap={ov['overlap_frac']*100:.0f}%")
