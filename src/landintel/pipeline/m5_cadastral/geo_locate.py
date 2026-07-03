@@ -46,13 +46,22 @@ def geocode(query: str) -> tuple[float, float] | None:
 
 
 def geocode_candidates(query: str, limit: int = 5) -> list[tuple[float, float]]:
-    """ALL (lat, lon) candidates for a place query via Nominatim, best-first.
+    """ALL (lat, lon) candidates for a place query, best-first.
 
-    TN village names recur (homonym villages) -- taking only the first hit silently
-    picks the wrong one (measured: MOOLAKARAI resolved to a same-named village 15+ km
-    east). Callers that hold an independent fingerprint (the FMB survey numbers)
-    should score EVERY candidate and let the fingerprint decide; the pin is a hint.
+    Provider is GENERAL and swappable (no village-specific logic):
+      * Google Maps Geocoding API when ``GOOGLE_MAPS_API_KEY`` (or
+        ``LANDINTEL_GOOGLE_MAPS_KEY``) is set -- far better on small Indian revenue
+        villages, which Nominatim frequently misplaces onto a same-named homonym
+        (measured: MOOLAKARAI landed 5.7 km off). Online + keyed.
+      * Nominatim otherwise (offline-default deployment, no key).
+
+    TN village names recur, so even a good geocoder returns homonyms: callers that
+    hold an independent fingerprint (the FMB survey numbers) MUST score every
+    candidate and let the fingerprint decide. The pin is only a hint.
     """
+    g = _google_geocode_candidates(query, limit)
+    if g is not None:
+        return g
     try:
         url = _NOMINATIM + "?" + urllib.parse.urlencode(
             {"q": query, "format": "json", "limit": int(limit)})
@@ -62,6 +71,32 @@ def geocode_candidates(query: str, limit: int = 5) -> list[tuple[float, float]]:
     except Exception as exc:  # noqa: BLE001
         _log.debug("geocode_candidates(%r) failed: %s", query, exc)
     return []
+
+
+def _google_geocode_candidates(query: str, limit: int) -> list[tuple[float, float]] | None:
+    """Google Maps geocode candidates, or None when no API key is configured (so the
+    caller falls back to Nominatim). Uses the REST endpoint directly -- no extra
+    dependency; if the optional ``googlemaps`` client is installed it is honoured too."""
+    import os
+    key = os.environ.get("GOOGLE_MAPS_API_KEY") or os.environ.get("LANDINTEL_GOOGLE_MAPS_KEY")
+    if not key:
+        return None
+    try:
+        url = "https://maps.googleapis.com/maps/api/geocode/json?" + urllib.parse.urlencode(
+            {"address": query, "key": key})
+        req = urllib.request.Request(url, headers=_UA)
+        data = json.load(urllib.request.urlopen(req, timeout=20))
+        if data.get("status") not in ("OK", "ZERO_RESULTS"):
+            _log.warning("Google geocode status=%s for %r", data.get("status"), query)
+        out = []
+        for r in (data.get("results") or [])[:int(limit)]:
+            loc = r.get("geometry", {}).get("location", {})
+            if "lat" in loc and "lng" in loc:
+                out.append((float(loc["lat"]), float(loc["lng"])))
+        return out
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("Google geocode failed for %r (%s); falling back to Nominatim", query, exc)
+        return None
 
 
 def rough_center(village: str, taluk: str = "", district: str = "",

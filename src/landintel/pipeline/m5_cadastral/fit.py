@@ -271,14 +271,14 @@ def _rigid_from_parcel(m1_ring: np.ndarray, parcel: CadastralParcel):
     target = _densify_ring(list(parcel.polygon.exterior.coords)[:-1])
     parcel_poly = parcel.polygon
 
-    # ICP-refine each distinct-orientation seed; record (residual, IoU, R, s, t).
-    refined: list[tuple[float, float, np.ndarray, float, np.ndarray]] = []
+    # ICP-refine each distinct-orientation seed; record (residual, IoU, R, s, t, source).
+    refined: list[tuple[float, float, np.ndarray, float, np.ndarray, str]] = []
     for _r0, R0, s0, t0 in seeds.values():
         R, s, t, resid = _icp_rigid(m1_ring, target, (R0, s0, t0))
         if not (0.5 < s < 2.0):
             continue
         iou = _placed_iou(m1_ring, R, s, t, parcel_poly)
-        refined.append((resid, iou, R, s, t))
+        refined.append((resid, iou, R, s, t, "icp"))
 
     # CLIENT-APPROACH candidate (base stone + rotation search, scale LOCKED to 1):
     # the unified rigid stone-matcher tries every FMB corner as the base point
@@ -298,7 +298,7 @@ def _rigid_from_parcel(m1_ring: np.ndarray, parcel: CadastralParcel):
             d, _ = cKDTree(target).query(cur)
             refined.append((float(d.mean()),
                             _placed_iou(m1_ring, sm.R, 1.0, sm.t, parcel_poly),
-                            sm.R, 1.0, sm.t))
+                            sm.R, 1.0, sm.t, f"stonematch:{sm.n_matched}/{sm.n_src}"))
     except Exception:  # noqa: BLE001 - the ICP path stands alone if this fails
         pass
 
@@ -311,7 +311,10 @@ def _rigid_from_parcel(m1_ring: np.ndarray, parcel: CadastralParcel):
     # Tie-break on lower residual. Outside the band, the lowest-residual pose still wins.
     in_band = [c for c in refined if c[0] <= band]
     pool = in_band if in_band else refined
-    resid, _iou, R, s, t = max(pool, key=lambda c: (c[1], -c[0]))
+    resid, _iou, R, s, t, src = max(pool, key=lambda c: (c[1], -c[0]))
+    _log.debug("rigid_from_parcel winner: source=%s resid=%.2f (%d candidates, "
+               "%d stonematch)", src, resid, len(refined),
+               sum(1 for c in refined if c[5].startswith("stonematch")))
     return R, s, t, resid
 
 

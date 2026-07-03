@@ -24,6 +24,25 @@ from pathlib import Path
 sys.path.insert(0, "src")
 sys.stdout.reconfigure(encoding="utf-8")
 
+
+def _load_dotenv(path: str = ".env") -> None:
+    """Load KEY=VALUE lines from .env into the environment (does not overwrite existing).
+    General + minimal (no extra dependency); lets the Google Maps geocoder key be picked up
+    automatically. The .env file is gitignored, so the key never enters the repo."""
+    try:
+        for line in Path(path).read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            os.environ.setdefault(k, v)
+    except FileNotFoundError:
+        pass
+
+
+_load_dotenv()
+
 from pyproj import Transformer
 from shapely.geometry import Point
 
@@ -157,17 +176,33 @@ def main() -> None:
     # survey-number density-peak + FMB-shape IoU still refine WHICH block is really ours.
     anchor_ll = None
     if opt["cx"] is None:
-        # No manual anchor -> the CoordinateFinderAgent finds it automatically (rough web geocode
-        # refined to the EXACT TNGIS village centroid by survey number). Keeps --lat/--lon optional.
-        from landintel.agents.coordinate_finder import CoordinateFinderAgent
-        cf = CoordinateFinderAgent().find(
-            village, surveys, district=opt["district"] or _taluk_district(m1_paths, village)[1],
-            taluk=opt["taluk"] or _taluk_district(m1_paths, village)[0], crs=CRS)
-        if cf.get("lat") is not None:
-            opt["cx"], opt["cy"] = Transformer.from_crs("EPSG:4326", CRS, always_xy=True).transform(
-                cf["lon"], cf["lat"])
-            print(f"[2/4] CoordinateFinderAgent: {village} @ ({cf['lat']},{cf['lon']}) "
-                  f"[{cf['confidence']}, {cf['method']}]")
+        district = opt["district"] or _taluk_district(m1_paths, village)[1]
+        taluk = opt["taluk"] or _taluk_district(m1_paths, village)[0]
+        # AUTHORITATIVE ANCHOR FIRST: when a Google Maps key is configured, its geocode of
+        # the village is the trusted location. TN village names recur (homonyms), so the
+        # survey-number coverage search can wander km away onto a same-named village -- Google
+        # pins the RIGHT settlement directly (measured: fixed MOOLAKARAI's 8 km mislocation).
+        # We use Google's pin as the anchor and let the block disambiguation below pick the
+        # local parcel block. Falls back to the CoordinateFinderAgent when no key is set.
+        import os as _os
+        from landintel.pipeline.m5_cadastral.geo_locate import _google_geocode_candidates
+        gk = _os.environ.get("GOOGLE_MAPS_API_KEY") or _os.environ.get("LANDINTEL_GOOGLE_MAPS_KEY")
+        g = _google_geocode_candidates(
+            f"{village}, {taluk}, {district}, Tamil Nadu, India", 1) if gk else None
+        if g:
+            lat, lon = g[0]
+            opt["cx"], opt["cy"] = Transformer.from_crs(
+                "EPSG:4326", CRS, always_xy=True).transform(lon, lat)
+            print(f"[2/4] Google Maps anchor: {village} @ ({lat:.5f},{lon:.5f}) [authoritative]")
+        else:
+            from landintel.agents.coordinate_finder import CoordinateFinderAgent
+            cf = CoordinateFinderAgent().find(village, surveys, district=district,
+                                              taluk=taluk, crs=CRS)
+            if cf.get("lat") is not None:
+                opt["cx"], opt["cy"] = Transformer.from_crs(
+                    "EPSG:4326", CRS, always_xy=True).transform(cf["lon"], cf["lat"])
+                print(f"[2/4] CoordinateFinderAgent: {village} @ ({cf['lat']},{cf['lon']}) "
+                      f"[{cf['confidence']}, {cf['method']}]")
     if opt["cx"] is not None:
         _lon, _lat = Transformer.from_crs(CRS, "EPSG:4326", always_xy=True).transform(
             opt["cx"], opt["cy"])
@@ -187,8 +222,11 @@ def main() -> None:
             raise SystemExit("vector mode needs a --lat/--lon (or --utm) anchor")
         from landintel.pipeline.m5_cadastral.vector_locate import (
             load_area_parcels_cached, village_candidates)
-        parcels = load_area_parcels_cached(
-            anchor_ll, cache_json=f"data/tngis/area_{village}.json")
+        # Cache key includes the ROUNDED anchor (~0.01 deg ~ 1 km) so a changed anchor never
+        # silently reuses a stale wrong-location cache (this bit us: a village-name-only cache
+        # from a wrong anchor persisted across runs).
+        _ck = f"data/tngis/area_{village}_{anchor_ll[0]:.2f}_{anchor_ll[1]:.2f}.json"
+        parcels = load_area_parcels_cached(anchor_ll, cache_json=_ck)
         eval_cands = village_candidates(parcels, surveys, (opt["cx"], opt["cy"]),
                                         radius_m=5000.0, min_overlap=3, max_cand=MAX_EVAL, crs=CRS)
         if not eval_cands:
@@ -261,11 +299,8 @@ def main() -> None:
     print(f"      -> chosen village block @ {chosen.get('center')} span={chosen.get('span_m')}m "
           f"(TNGIS-overlay IoU={_score[0]}, ACCEPT={_score[1]})")
 
-    print("[4/4] quality pass: edge-align + corner-snap + club-all reseat (0-FP)...")
-    # club_all: M2 is a REFERENCE for the surveyor -- every placed plot ships in the ONE
-    # main club; low-confidence plots additionally take the full gap toward confident
-    # neighbours' shared edges (translation-only, capped, overlap-reverted).
-    snap_and_rewrite(results, out, crs=CRS, enable=True, tol=8.0, club_all=True)
+    print("[4/4] quality pass: edge-align + corner-snap (0-FP)...")
+    snap_and_rewrite(results, out, crs=CRS, enable=True, tol=8.0)
 
     # --- Agent verification of the chosen club (each agent owns one job, 0-FP) ---
     fps = {r.survey_number: r.placement.footprint() for r in results if r.placement}
@@ -406,45 +441,41 @@ def main() -> None:
     print(f"\nPLACED: {len(placed)}/{len(results)} onto cadastral parcels  "
           f"(clubbed FMB<->TNGIS mean IoU {ov['mean_iou']:.2f})")
 
-    # RE-CLUB with the FINAL dispositions -- CLUB-ALL MODE (client directive 2026-07-03:
-    # "M2 output is a reference for the surveyor; club all with 0 review, max accuracy").
-    # snap_and_rewrite ran at [4/4] BEFORE the IoU/containment/stone promotions, so rebuild
-    # from the finalized set, reusing the already-snapped per-plot georef DXFs. EVERY placed
-    # plot goes into the ONE clubbed_village.dxf: the confident tiling as FMB_<sn> blocks and
-    # the best-effort (divergent-cadastre / under-constrained) plots as FMB_<sn>_LOWCONF
-    # blocks. The gates still ran -- their verdicts became the confidence TIER, not an
-    # exclusion. Precision is M3's job (surveyor data); M2 maximizes completeness.
+    # RE-CLUB with the FINAL dispositions -- HONEST SPLIT (2026-07-03: never present a
+    # divergent plot as 'placed' -- that is the false positive that costs the client's trust).
+    # The MAIN clubbed_village.dxf is ONLY the plots that genuinely overlay their cadastre
+    # parcel (ACCEPT). Plots whose FMB diverges from the current cadastre go to a SEPARATE
+    # clubbed_needs_survey.dxf, clearly labelled as NOT confidently placed -- they are the
+    # surveyor's worklist (resolved with real field data in M3), not a delivered placement.
     from landintel.pipeline.m2_club.club_output import club_dxf
     placed_specs = [(r.output_file, r.survey_number) for r in results
                     if r.recommendation in ("ACCEPT", "ACCEPT_SEEDED")
                     and r.output_file and Path(r.output_file).exists()]
-    lowconf_specs = [(r.output_file, r.survey_number) for r in results
-                     if r.recommendation == "REVIEW"
-                     and r.output_file and Path(r.output_file).exists()]
+    review_specs = [(r.output_file, r.survey_number) for r in results
+                    if r.recommendation == "REVIEW"
+                    and r.output_file and Path(r.output_file).exists()]
     # CLIENT RULE: the FMB scale / edge lengths / properties are NEVER changed while matching
-    # stones and clubbing. So the clubbed map keeps each plot's OWN rigid-placed FMB boundary
-    # (edge lengths preserved exactly); neighbours are aligned only by their shared STONES
-    # (snap_shared_boundaries), never warped onto the cadastre. (The cadastre-boundary override
-    # was rejected: it rewrote the FMB boundary.)
-    club_dxf(placed_specs, [], out / "clubbed_village.dxf", crs=CRS,
-             review_specs=None, lowconf_specs=lowconf_specs)
-    rev_path = out / "clubbed_review.dxf"
-    if rev_path.exists():
-        rev_path.unlink()                      # club-all: no separate review file
+    # stones and clubbing -- each plot keeps its OWN rigid-placed FMB boundary; neighbours are
+    # aligned only by shared STONES, never warped onto the cadastre.
+    club_dxf(placed_specs, [], out / "clubbed_village.dxf", crs=CRS, review_specs=None)
+    rev_path = out / "clubbed_needs_survey.dxf"
+    old_rev = out / "clubbed_review.dxf"
+    if old_rev.exists():
+        old_rev.unlink()
+    if review_specs:
+        club_dxf(review_specs, [], rev_path, crs=CRS)
+    elif rev_path.exists():
+        rev_path.unlink()
 
-    # Confidence tiers for the deliverable (labels, not exclusions):
-    #   HIGH   = confident placement + full conditional stone match (min(5, n_corners))
-    #   MEDIUM = confident placement (gate-passed / corroborated / containment)
-    #   LOW    = best-effort placement (FMB diverges from the current cadastre, or
-    #            under-constrained) -- clubbed at its best position, flagged for M3
+    # HONEST accounting -- confident placement vs surveyor worklist, never inflated.
+    n_placed = len(placed_specs)
     n_high = sum(1 for r in results if r.placed and r.placement is not None
                  and getattr(r.placement, "full_stone_match", False))
-    n_med = sum(1 for r in results if r.placed) - n_high
-    n_low = len(lowconf_specs)
-    n_clubbed = len(placed_specs) + n_low
-    print(f"\nCLUB-ALL    : {n_clubbed}/{len(results)} FMBs clubbed into ONE file "
-          f"(HIGH {n_high} / MEDIUM {n_med} / LOW {n_low}) -- review 0, "
-          f"nothing withheld; LOW = FMB-vs-cadastre divergence, resolved by M3")
+    n_need = len(review_specs)
+    verdict = "CLEAN" if n_need == 0 else f"{n_need} diverge -> surveyor"
+    print(f"\nHONEST RESULT: {n_placed}/{len(results)} CONFIDENTLY PLACED on cadastre "
+          f"({n_high} full-stone-match) | {n_need} DIVERGE from cadastre -> "
+          f"clubbed_needs_survey.dxf (M3/field). [{verdict}]")
     # Re-write the companion geojson/csv from the SNAPPED placements (snap_and_rewrite wrote them
     # pre-snap / pre-promotion, so they were stale).
     from landintel.pipeline.m2_club.club_output import write_geojson, write_points_csv
