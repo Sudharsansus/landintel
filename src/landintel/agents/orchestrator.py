@@ -111,6 +111,18 @@ def run_agent_layer(results, output_dir, context: dict | None = None) -> dict:
         "proposals": [p.to_dict() for p in proposals],
     })
 
+    # DECISION TRACE: consolidate the final per-plot state (disposition + the evidence the
+    # gate saw + proposals re-gated + input requested) into ONE auditable record, so an
+    # expert verifies "why plot X landed there" without cross-referencing three JSONs.
+    # Built from the FINAL results (post-demote, post-regate); pure aggregation, no decision.
+    try:
+        from .decision_trace import build_decision_trace
+        write_json(output_dir / "decision_trace.json",
+                   build_decision_trace(results, proposals, requests,
+                                        context.get("village")))
+    except Exception as exc:  # noqa: BLE001 - the audit trail must never break a job
+        _log.error("Decision-trace export failed: %s", exc)
+
     # Record this whole job into the persistent memory graph (every plot disposition, the
     # proposals tried + gate verdicts, and the input requests) so future sessions remember it.
     mem_stats = {}

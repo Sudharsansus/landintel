@@ -245,6 +245,40 @@ def test_llm_assist_mixed_stage_list(monkeypatch):
     assert all(p.action in SAFE_ACTIONS for p in rep.proposals)
 
 
+# =========================================================== decision trace ====
+def test_decision_trace_consolidates_both_stages_and_is_read_only():
+    from landintel.agents.decision_trace import build_decision_trace
+
+    # a mixed job: an M2 ACCEPT with a footprint, an M3 REVIEW, an M2 NO_COVERAGE.
+    a = _club("724", "ACCEPT", cx=0.0, cy=0.0, conf=0.9)
+    b = _georef("699", "REVIEW", "geometric_6/7", cov=0.25)
+    c = _club("900", "NO_COVERAGE", method="")
+    before = [r.recommendation for r in (a, b, c)]
+
+    # a proposal on 699 and an input request on 900 must fold into the SAME per-plot record.
+    prop = type("P", (), {"survey_number": "699", "action": "increase_ocr_angles",
+                          "hypothesis": "partial trace", "accepted_by_gate": False,
+                          "note": "re-ran: gate still REVIEW"})()
+    reqs = [{"survey_number": "900", "input_type": "TWO_CORNER_SEED", "reason": "no position"}]
+
+    trace = build_decision_trace([a, b, c], [prop], reqs, village="INGUR")
+
+    # read-only: building the trace must not mutate any disposition
+    assert [r.recommendation for r in (a, b, c)] == before
+    assert trace["n_plots"] == 3 and trace["n_confident"] == 1
+    rows = {r["survey_number"]: r for r in trace["plots"]}
+    # both stages represented, stage-tagged
+    assert rows["724"]["stage"] == "club" and rows["699"]["stage"] == "georef"
+    # confident row first (ordered confident-first)
+    assert trace["plots"][0]["survey_number"] == "724" and trace["plots"][0]["confident"]
+    # proposal + request folded onto the right plots
+    assert rows["699"]["proposals"][0]["action"] == "increase_ocr_angles"
+    assert rows["900"]["input_request"]["input_type"] == "TWO_CORNER_SEED"
+    # evidence keeps applicable numbers and drops NaN/inf (chain_coverage present on geo path)
+    assert rows["699"]["evidence"].get("chain_coverage") == 0.25
+    assert all(v == v for v in rows["724"]["evidence"].values())   # no NaN leaked through
+
+
 # ===================================== cross-cutting: no agent ever promotes ===
 def test_no_agent_promotes_a_non_accept(monkeypatch):
     monkeypatch.setenv("LANDINTEL_LLM_ORDER", "")
