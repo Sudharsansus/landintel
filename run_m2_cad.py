@@ -367,13 +367,24 @@ def main() -> None:
     review_specs = [(r.output_file, r.survey_number) for r in results
                     if r.recommendation == "REVIEW"
                     and r.output_file and Path(r.output_file).exists()]
-    club_dxf(placed_specs, [], out / "clubbed_village.dxf", crs=CRS, review_specs=None)
+    # Clubbed map uses the EXACT cadastre parcel edge for each ACCEPT plot's boundary -> the
+    # neighbours share one TNGIS line (perfect tiling, no gap/double). Interior FMB detail kept.
+    bnd_override = {r.survey_number: parcels.get(r.survey_number) for r in results
+                    if r.recommendation in ("ACCEPT", "ACCEPT_SEEDED")
+                    and parcels.get(r.survey_number) is not None}
+    club_dxf(placed_specs, [], out / "clubbed_village.dxf", crs=CRS, review_specs=None,
+             boundary_override=bnd_override)
     rev_path = out / "clubbed_review.dxf"
     if review_specs:
         club_dxf(review_specs, [], rev_path, crs=CRS)
         print(f"Review DXF  : {rev_path} ({len(review_specs)} lower-confidence/divergent plots)")
     elif rev_path.exists():
         rev_path.unlink()
+    # Re-write the companion geojson/csv from the SNAPPED placements (snap_and_rewrite wrote them
+    # pre-snap / pre-promotion, so they were stale).
+    from landintel.pipeline.m2_club.club_output import write_geojson, write_points_csv
+    write_geojson(results, out / "clubbed.geojson", crs=CRS)
+    write_points_csv(results, out / "clubbed_points.csv", crs=CRS)
 
     try:
         render_club_qa(results, out / "clubbed_qa.png", cadastral_source=cad, crs=CRS)
