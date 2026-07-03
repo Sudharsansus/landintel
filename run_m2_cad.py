@@ -28,7 +28,7 @@ from pyproj import Transformer
 from shapely.geometry import Point
 
 from landintel.pipeline.m2_club import club_pipeline
-from landintel.pipeline.m2_club.agents import (
+from landintel.agents.club_agents import (
     AssemblyAgent,
     ParcelAgent,
     TngisOverlayAgent,

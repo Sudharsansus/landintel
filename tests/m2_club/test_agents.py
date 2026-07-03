@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from shapely.geometry import Polygon
 
-from landintel.pipeline.m2_club.agents import (
+from landintel.agents.club_agents import (
     AssemblyAgent,
     ParcelAgent,
     TngisOverlayAgent,
