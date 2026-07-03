@@ -378,3 +378,151 @@ def propagate_from_seated(
              f"(shared edge {len_a:.1f}/{len_b:.1f} m, tile-overlap {ov_a:.0%}, "
              f"{n_fit_pts}-pt fit)",
     )
+
+
+# Label-free geometric propagation: minimum coincident corners (endpoints + extras)
+# required to accept a placement. A chance length-match of two unrelated edges will not
+# also put >=1 further corner on a neighbour corner, so this is the 0-FP gate (client's
+# ">= 3 stone points per FMB"). GENERAL -- pure geometry, no OCR labels, no per-village value.
+GEO_MIN_SHARED_CORNERS = 3
+
+
+def propagate_geometric(
+    m1_b: M1PlotData,
+    placement_a: CandidatePlacement,
+    m1_a: M1PlotData,
+    placed_footprints: list,
+    *,
+    min_shared: int = GEO_MIN_SHARED_CORNERS,
+) -> CandidatePlacement | None:
+    """Seat ``m1_b`` against already-placed ``m1_a`` by a SHARED EDGE found purely
+    geometrically -- NO neighbour labels (they are too noisy to rely on).
+
+    For every A corner-edge x every B corner-edge of matching length, both endpoint
+    orientations are fitted (rigid, scale~1); a candidate is kept only if, after
+    alignment, at least ``min_shared`` B corners coincide with A corners (the two edge
+    endpoints + >=1 more) AND the plot tiles (no interior overlap with A or any placed
+    plot). The extra-corner corroboration is what makes a chance length-match impossible
+    to accept -- so this is 0-FP without any label. The winning pose is then re-fit by
+    least squares over ALL coincident corners. Returns a ``CandidatePlacement``
+    (``method="relative"``) or None.
+    """
+    from shapely.geometry import Polygon
+
+    adj_a = np.asarray(placement_a.adjusted, float)
+    a_ring = [i for i in placement_a.corner_ring if 0 <= i < len(adj_a)]
+    if len(a_ring) < 3:
+        return None
+    a_corners = adj_a[np.array(a_ring)]                    # absolute UTM A corners
+    a_edges = [(a_corners[k], a_corners[(k + 1) % len(a_corners)])
+               for k in range(len(a_corners))]
+
+    all_b = m1_b.stone_positions()
+    b_ring = [i for i in m1_b.outer_stone_indices if 0 <= i < len(all_b)]
+    if len(b_ring) < 3:
+        return None
+    b_corners_rel = all_b[np.array(b_ring)]
+    b_edges = [(b_corners_rel[k], b_corners_rel[(k + 1) % len(b_corners_rel)])
+               for k in range(len(b_corners_rel))]
+
+    a_fp = placement_a.footprint()
+
+    def _shared_count(adjusted_ring: np.ndarray) -> int:
+        """How many B corners land within EDGE_COINCIDE_TOL of a DISTINCT A corner."""
+        used, cnt = set(), 0
+        for bc in adjusted_ring:
+            d = np.hypot(a_corners[:, 0] - bc[0], a_corners[:, 1] - bc[1])
+            ai = int(np.argmin(d))
+            if d[ai] <= EDGE_COINCIDE_TOL and ai not in used:
+                used.add(ai); cnt += 1
+        return cnt
+
+    best = None  # (shared_count, -overlap, R, s, t, adjusted, poly)
+    for (A1, A2) in a_edges:
+        La = float(np.hypot(*(A2 - A1)))
+        for (B1, B2) in b_edges:
+            Lb = float(np.hypot(*(B2 - B1)))
+            if not _len_agrees(La, Lb):
+                continue
+            for dst in ((A1, A2), (A2, A1)):
+                R, s, t, _r = umeyama(np.array([B1, B2]), np.array([dst[0], dst[1]]))
+                if not (PROP_SCALE_LO <= s <= PROP_SCALE_HI):
+                    continue
+                adjusted = s * (all_b @ R.T) + t
+                ring_xy = adjusted[np.array(b_ring)]
+                poly = Polygon([(float(x), float(y)) for x, y in ring_xy])
+                if not poly.is_valid:
+                    poly = poly.buffer(0)
+                if poly.is_empty or poly.area <= 0:
+                    continue
+                # tiling gate vs A and all placed
+                ov = 0.0
+                if a_fp is not None and poly.intersects(a_fp):
+                    ov = poly.intersection(a_fp).area / max(min(poly.area, a_fp.area), 1e-9)
+                if ov > PROP_MAX_OVERLAP:
+                    continue
+                bad = False
+                for fp in placed_footprints:
+                    if fp is None or not poly.intersects(fp):
+                        continue
+                    o = poly.intersection(fp).area / max(min(poly.area, fp.area), 1e-9)
+                    if o > PROP_MAX_OVERLAP:
+                        bad = True; break
+                if bad:
+                    continue
+                shared = _shared_count(ring_xy)
+                if shared < min_shared:
+                    continue
+                key = (shared, -ov)
+                if best is None or key > (best[0], best[1]):
+                    best = (shared, -ov, R, float(s), t, adjusted, poly)
+
+    if best is None:
+        return None
+    shared, neg_ov, R, s, t, adjusted, poly = best
+
+    # Least-squares re-fit over ALL coincident corners (>=3) so no single endpoint error
+    # drives the placement; must re-pass scale, else the gated 2-point pose stands.
+    src, dst = [], []
+    used_a = set()
+    for bi in b_ring:
+        bp = adjusted[bi]
+        d = np.hypot(a_corners[:, 0] - bp[0], a_corners[:, 1] - bp[1])
+        ai = int(np.argmin(d))
+        if d[ai] <= EDGE_COINCIDE_TOL and ai not in used_a:
+            src.append(all_b[bi]); dst.append(a_corners[ai]); used_a.add(ai)
+    if len(src) >= 3:
+        R2, s2, t2, _r2 = umeyama(np.array(src, float), np.array(dst, float))
+        if PROP_SCALE_LO <= s2 <= PROP_SCALE_HI:
+            adj2 = s2 * (all_b @ R2.T) + t2
+            ring2 = adj2[np.array(b_ring)]
+            p2 = Polygon([(float(x), float(y)) for x, y in ring2])
+            if not p2.is_valid:
+                p2 = p2.buffer(0)
+            # Re-verify the refit STILL tiles (refit can nudge into an overlap); only adopt
+            # it if it does, else the gated pre-refit pose stands.
+            ok2 = (not p2.is_empty and p2.area > 0)
+            if ok2 and a_fp is not None and p2.intersects(a_fp):
+                ok2 = (p2.intersection(a_fp).area / max(min(p2.area, a_fp.area), 1e-9)
+                       <= PROP_MAX_OVERLAP)
+            if ok2:
+                for fp in placed_footprints:
+                    if fp is None or not p2.intersects(fp):
+                        continue
+                    if (p2.intersection(fp).area / max(min(p2.area, fp.area), 1e-9)
+                            > PROP_MAX_OVERLAP):
+                        ok2 = False
+                        break
+            if ok2:
+                R, s, t, adjusted = R2, float(s2), t2, adj2
+
+    return CandidatePlacement(
+        method="relative",
+        R=R, s=s, t=t,
+        adjusted=adjusted,
+        corner_ring=list(m1_b.outer_stone_indices),
+        passes_gate=True,
+        scale=s,
+        note=f"relative stone-match to {m1_a.survey_number} "
+             f"({shared} shared corners, label-free)",
+    )

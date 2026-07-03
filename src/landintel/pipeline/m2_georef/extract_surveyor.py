@@ -84,6 +84,18 @@ def extract_corridor_surveys(
 # Point codes that represent property boundary markers.
 BOUNDARY_CODES = {"B", "BS", "RBS", "VBS", "RB", "RS"}
 
+
+def _is_boundary_code(code: str) -> bool:
+    """True if a stone code denotes a boundary marker -- GENERAL, no per-file list.
+
+    Matches an exact boundary code OR any composite whose hyphen/space-separated tokens
+    include one (e.g. 'VBS-RBS', 'B-X', 'BS-x'), so surveyor variants are covered while
+    auxiliary points (T, FNC, CW, AP-104, GPS-2, ...) are excluded."""
+    if not code:
+        return False
+    parts = [p.strip().upper() for p in code.replace(" ", "-").split("-")]
+    return any(p in BOUNDARY_CODES for p in parts)
+
 # Maximum distance (metres) to associate a TEXT label with a POINT entity.
 _LABEL_ASSOC_DIST = 2.0
 
@@ -169,12 +181,20 @@ class SurveyorData:
                 float(xs.max()), float(ys.max()))
 
 
-def extract_surveyor(dxf_path: str | Path) -> SurveyorData:
+def extract_surveyor(
+    dxf_path: str | Path,
+    bbox: tuple[float, float, float, float] | None = None,
+) -> SurveyorData:
     """Parse the surveyor's DXF and return structured boundary data.
 
     Parameters
     ----------
     dxf_path : path to the surveyor DXF file
+    bbox : optional (xmin, ymin, xmax, ymax) in the surveyor's own UTM metres. When
+        given, ONLY stones inside it are kept -- the caller crops to the target
+        village's window so a small plot is matched against its own village's stones,
+        not a whole taluk's cloud (both a speed and a false-match reduction). General:
+        the window is a parameter, never a per-village constant.
 
     Returns
     -------
@@ -188,7 +208,10 @@ def extract_surveyor(dxf_path: str | Path) -> SurveyorData:
 
     data = SurveyorData(source_file=str(dxf_path))
 
-    # --- Step 1: Collect all POINT entities and TEXT labels ---
+    def _in_bbox(x: float, y: float) -> bool:
+        return bbox is None or (bbox[0] <= x <= bbox[2] and bbox[1] <= y <= bbox[3])
+
+    # --- Step 1: Collect POINT entities and Point_Code TEXT labels ---
     raw_points: list[tuple[float, float]] = []
     for e in msp.query("POINT"):
         raw_points.append((e.dxf.location.x, e.dxf.location.y))
@@ -198,36 +221,45 @@ def extract_surveyor(dxf_path: str | Path) -> SurveyorData:
         raw_labels.append((e.dxf.insert.x, e.dxf.insert.y,
                            str(e.dxf.text).strip()))
 
-    if not raw_points or not raw_labels:
-        _log.warning("No POINT or Point_Code TEXT entities found in surveyor DXF")
+    if not raw_labels:
+        _log.warning("No Point_Code TEXT entities found in surveyor DXF")
         return data
 
-    _log.info("Surveyor DXF: %d POINT entities, %d Point_Code labels",
-              len(raw_points), len(raw_labels))
-
-    # --- Step 2: Match each POINT to its nearest label ---
-    pt_arr = np.array(raw_points)
-    label_arr = np.array([(lx, ly) for lx, ly, _ in raw_labels])
-    label_tree = cKDTree(label_arr)
-    dists, label_idxs = label_tree.query(pt_arr)
-
     code_counts = defaultdict(int)
-    for i, (px, py) in enumerate(raw_points):
-        label = raw_labels[label_idxs[i]][2]
-        dist = dists[i]
-        if dist > _LABEL_ASSOC_DIST:
-            _log.debug("Point (%.1f, %.1f) no label within %.1fm (nearest '%s' at %.2fm)",
-                       px, py, _LABEL_ASSOC_DIST, label, dist)
-            continue
-        code_counts[label] += 1
-        if label in BOUNDARY_CODES:
-            data.stones.append(
-                SurveyorStone(x=px, y=py, code=label, index=len(data.stones))
-            )
+    if raw_points:
+        # --- POINT + nearest-label path (INGUR convention; unchanged) ---
+        _log.info("Surveyor DXF: %d POINT entities, %d Point_Code labels",
+                  len(raw_points), len(raw_labels))
+        pt_arr = np.array(raw_points)
+        label_arr = np.array([(lx, ly) for lx, ly, _ in raw_labels])
+        label_tree = cKDTree(label_arr)
+        dists, label_idxs = label_tree.query(pt_arr)
+        for i, (px, py) in enumerate(raw_points):
+            label = raw_labels[label_idxs[i]][2]
+            if dists[i] > _LABEL_ASSOC_DIST or not _in_bbox(px, py):
+                continue
+            code_counts[label] += 1
+            if _is_boundary_code(label):
+                data.stones.append(
+                    SurveyorStone(x=px, y=py, code=label, index=len(data.stones)))
+    else:
+        # --- TEXT-only path (no POINT entities): the Point_Code TEXT IS the stone,
+        # positioned at its insert point with the code as its text. General fallback
+        # for surveyor exports that omit POINT entities. ---
+        _log.info("Surveyor DXF: no POINT entities; using %d Point_Code TEXT as stones",
+                  len(raw_labels))
+        for lx, ly, code in raw_labels:
+            if not _in_bbox(lx, ly):
+                continue
+            code_counts[code] += 1
+            if _is_boundary_code(code):
+                data.stones.append(
+                    SurveyorStone(x=lx, y=ly, code=code, index=len(data.stones)))
 
-    _log.info("Point code distribution: %s", dict(code_counts))
-    _log.info("Extracted %d boundary stones (B/BS/RBS/VBS/RB/RS)",
-              len(data.stones))
+    _log.info("Point code distribution (top): %s",
+              dict(sorted(code_counts.items(), key=lambda kv: -kv[1])[:10]))
+    _log.info("Extracted %d boundary stones (B/BS/RBS/VBS/RB/RS)%s",
+              len(data.stones), f" within bbox {bbox}" if bbox else "")
 
     if not data.stones:
         _log.warning("No boundary stones found after filtering")

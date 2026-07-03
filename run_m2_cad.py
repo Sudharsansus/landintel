@@ -111,8 +111,12 @@ def _taluk_district(m1_paths: list[str], village: str) -> tuple[str, str]:
     return "", "Erode"     # sensible default for this delivery region
 
 
-def _divergence_note(disp: str, ratio: float) -> str:
+def _divergence_note(disp: str, ratio: float, method: str = "") -> str:
     if disp == "ACCEPT":
+        if method == "relative":
+            # placed by shared stones with a confident neighbour, NOT by the cadastre --
+            # its IoU vs the same-numbered parcel stays low because that parcel diverged.
+            return "placed by shared stones w/ neighbour (cadastre extent diverges)"
         return "matches cadastre"
     if ratio and ratio > 2.5:
         return "FMB >> cadastre#: govt renumber / different parcel -> field-verify"
@@ -147,7 +151,7 @@ def _write_divergence_report(results, ious, parcels, fps, out, village) -> None:
         nrev += r.recommendation != "ACCEPT"
         iou_s = f"{iou:5.2f}" if iou is not None else "  -  "
         lines.append(f"{sv:>6} {r.recommendation:<8} {iou_s} {fa/1e4:8.3f} {ca/1e4:8.3f} "
-                     f"{ratio:6.2f}  {_divergence_note(r.recommendation, ratio)}")
+                     f"{ratio:6.2f}  {_divergence_note(r.recommendation, ratio, r.method)}")
     lines += ["-" * 82,
               f"ACCEPT {nacc} / REVIEW {nrev} / total {nacc + nrev}   "
               f"(0 false positives; village lock decisive)"]
@@ -383,13 +387,61 @@ def main() -> None:
                 + f"under-constrained: {len(r.placement.corner_ring)}<{CAD_MIN_STONES} corner stones"
             n_fewstone += 1
 
-    # FINAL NON-OVERLAPPING-TILING pass (fixes an ordering bug found in agent review): the inline
-    # AssemblyAgent ran BEFORE the IoU/containment promotions, so a plot promoted afterwards that
-    # overlaps a neighbour (an oversized nested FMB) was never overlap-checked and could ship as a
-    # STACKED ACCEPT. Re-run the tiling demotion on the FINAL ACCEPT set. Threshold = the pipeline's
-    # established 0.30 (NOT the surveyor-path's stricter 0.20): FMB geometry is preserved (never
-    # warped to the cadastre), so adjacent FMBs share edges and overlap a little by design -- only a
-    # genuine >30% stack is demoted. Demote-only -> 0-FP; demoted plots go to the review file.
+    # GENERAL RELATIVE STONE-MATCH RECOVERY (client's FMBS_STONES_MATCH, label-free) --
+    # place ANY plot that diverges from the cadastre (REVIEW) by the corner stones it SHARES
+    # with a confident ACCEPT neighbour. Pure geometry (rigid, scale~1, >=3 coincident corners
+    # + tiling gate = 0-FP), M1-only (no surveyor, no M2 output). A NO-OP where the cadastre
+    # already fits (a village with 0 REVIEW skips it); recovers divergent plots wherever they
+    # occur. Runs BEFORE the final tiling pass so recovered plots go through the SAME 0.30
+    # non-overlap gate as every other ACCEPT -- no separate/tuned overlap rule.
+    from landintel.pipeline.m2_club.relative_club import propagate_geometric
+    from landintel.pipeline.m2_club.club_output import write_plot_dxf
+    from landintel.pipeline.m2_georef.extract_m1 import extract_m1_dxf
+    _m1c: dict[str, object] = {}
+
+    def _m1of(res):
+        if res.survey_number not in _m1c:
+            _m1c[res.survey_number] = extract_m1_dxf(res.m1_file)
+        return _m1c[res.survey_number]
+
+    n_recovered = 0
+    for _rnd in range(6):                      # newly recovered plots can seat further ones
+        acc = [r for r in results if r.recommendation in ("ACCEPT", "ACCEPT_SEEDED")
+               and r.placement is not None]
+        placed_fps = [r.placement.footprint() for r in acc]   # live: updated per placement
+        changed = False
+        for r in results:
+            if r.recommendation != "REVIEW" or r.placement is None:
+                continue
+            mb = _m1of(r)
+            for a in acc:
+                cand = propagate_geometric(mb, a.placement, _m1of(a), placed_fps)
+                if cand is not None:
+                    r.placement = cand
+                    r.recommendation = "ACCEPT"
+                    r.method = "relative"
+                    r.note = (r.note + " | " if r.note else "") + cand.note
+                    placed_fps.append(cand.footprint())   # no same-round stack
+                    acc.append(r)
+                    try:                       # re-write this plot's georef DXF from the new pose
+                        outp = out / f"georef_{Path(r.m1_file).stem}.dxf"
+                        write_plot_dxf(r.m1_file, cand, outp, CRS)
+                        r.output_file = str(outp)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"(recover: DXF re-write failed for {r.survey_number}: {exc})")
+                    n_recovered += 1
+                    changed = True
+                    break
+        if not changed:
+            break
+    if n_recovered:
+        print(f"[RelativeRecovery] placed {n_recovered} divergent plot(s) by shared stones "
+              f"with confident neighbours (label-free FMBS_STONES_MATCH)")
+
+    # FINAL NON-OVERLAPPING-TILING pass on the WHOLE ACCEPT set (cadastre + relative). Threshold
+    # = the pipeline's established 0.30 (FMB geometry is preserved, never warped, so adjacent
+    # divergent-extent FMBs overlap a little by design -- only a genuine >30% stack is demoted).
+    # Demote-only -> 0-FP; demoted plots go to the review file. Same gate for every ACCEPT.
     fin_acc = {r.survey_number for r in results if r.recommendation in ("ACCEPT", "ACCEPT_SEEDED")}
     fin_fps = {r.survey_number: r.placement.footprint() for r in results
                if r.placement is not None and r.survey_number in fin_acc}
