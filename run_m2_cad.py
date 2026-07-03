@@ -354,6 +354,27 @@ def main() -> None:
     print(f"\nPLACED: {len(placed)}/{len(results)} onto cadastral parcels  "
           f"(clubbed FMB<->TNGIS mean IoU {ov['mean_iou']:.2f})")
 
+    # RE-CLUB with the FINAL dispositions. snap_and_rewrite ran at [4/4] BEFORE the IoU/
+    # containment/stone promotions, so its clubbed DXF reflected the stale (pre-promotion)
+    # recommendations. Rebuild now from the finalized set, reusing the already-snapped per-plot
+    # georef DXFs: the MAIN clubbed_village.dxf is the clean ACCEPT tiling; REVIEW plots (which
+    # diverge from the cadastre and overlap) go to a SEPARATE clubbed_review.dxf so they no longer
+    # pile onto the map. ACCEPT-only villages are unchanged.
+    from landintel.pipeline.m2_club.club_output import club_dxf
+    placed_specs = [(r.output_file, r.survey_number) for r in results
+                    if r.recommendation in ("ACCEPT", "ACCEPT_SEEDED")
+                    and r.output_file and Path(r.output_file).exists()]
+    review_specs = [(r.output_file, r.survey_number) for r in results
+                    if r.recommendation == "REVIEW"
+                    and r.output_file and Path(r.output_file).exists()]
+    club_dxf(placed_specs, [], out / "clubbed_village.dxf", crs=CRS, review_specs=None)
+    rev_path = out / "clubbed_review.dxf"
+    if review_specs:
+        club_dxf(review_specs, [], rev_path, crs=CRS)
+        print(f"Review DXF  : {rev_path} ({len(review_specs)} lower-confidence/divergent plots)")
+    elif rev_path.exists():
+        rev_path.unlink()
+
     try:
         render_club_qa(results, out / "clubbed_qa.png", cadastral_source=cad, crs=CRS)
     except Exception as exc:  # noqa: BLE001

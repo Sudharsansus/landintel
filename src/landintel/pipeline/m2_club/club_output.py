@@ -358,8 +358,16 @@ def snap_and_rewrite(
         else:
             staged_specs.append((r.m1_file, r.survey_number))
 
+    # The MAIN clubbed village is the clean, confidently-placed ACCEPT tiling only. REVIEW plots
+    # are (by definition) lower-confidence -- for these villages that means the FMB extent
+    # DIVERGES from the current cadastre, so they overlap their neighbours and cannot tile. Keeping
+    # them in the main map is exactly what made KANDAMPALAYAM read as "scattered / dumped". They
+    # are still delivered (per-plot georef_<>.dxf + a separate clubbed_review.dxf) for field
+    # verification, just not piled onto the clean tiling. ACCEPT-only villages are unchanged.
     club_dxf(placed_specs, staged_specs, output_dir / "clubbed_village.dxf",
-             crs=crs, review_specs=review_specs)
+             crs=crs, review_specs=None)
+    if review_specs:
+        club_dxf(review_specs, [], output_dir / "clubbed_review.dxf", crs=crs)
     write_geojson(results, output_dir / "clubbed.geojson", crs=crs)
     write_points_csv(results, output_dir / "clubbed_points.csv", crs=crs)
     return stats
