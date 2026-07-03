@@ -50,8 +50,8 @@ except Exception:  # noqa: BLE001
 _SCALE_MIN, _SCALE_MAX = 0.8, 1.25
 
 # Interior overlap (fraction of the SMALLER footprint) above which two ACCEPTs cannot
-# both stand -- same threshold the pipeline's conflict resolver uses.
-_TILING_OVERLAP_MAX = 0.20
+# both stand -- the SAME centralized threshold every consumer uses (rationale there).
+from .disposition_thresholds import TILING_OVERLAP_THRESHOLD as _TILING_OVERLAP_MAX  # noqa: E402
 
 _VALID_RECS = ("ACCEPT", "ACCEPT_SEEDED", "REVIEW", "NO_COVERAGE")
 

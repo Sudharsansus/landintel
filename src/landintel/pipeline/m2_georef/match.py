@@ -473,6 +473,22 @@ def geometric_match(
     m1_pos = m1.stone_positions()
     cpts = np.array([m1_pos[i] for i in corners])  # corner template (N, 2)
 
+    # Ring sanity guard -- M1-QUALITY OBSERVABILITY (client rule: M1 first). A
+    # duplicate corner vertex means the M1 extraction handed us a degraded ring;
+    # surface it in the log so the fix happens UPSTREAM in M1, never by loosening
+    # a gate here. Matching only refuses when the ring is truly degenerate
+    # (< 3 DISTINCT corners -- no 2D congruence is defined for a line/point).
+    n_distinct = len({(round(float(x), 6), round(float(y), 6)) for x, y in cpts})
+    if n_distinct < len(cpts):
+        _log.warning(
+            "plot %s: corner ring has duplicate vertices (%d corners, %d distinct)"
+            " -- M1 extraction fidelity issue; fix upstream in M1",
+            m1.survey_number, len(cpts), n_distinct)
+    if n_distinct < 3:
+        _log.warning("plot %s: degenerate corner ring (< 3 distinct corners) -- no match",
+                     m1.survey_number)
+        return _no_match(m1)
+
     # Candidate surveyor pairs come from BOTH traced chain edges and, for each
     # baseline length, any stone pair near that distance (radius query) -- so a
     # plot still matches even if the surveyor never traced that exact edge.

@@ -53,8 +53,10 @@ def build_geoagent(results, context: dict | None = None):
         return None
 
     tools = build_tools(results, context)
-    order = os.environ.get("LANDINTEL_LLM_ORDER", "local").split(",")   # offline-only default
-    provider = _PROVIDER_MAP.get(order[0].strip(), "anthropic")
+    # Strip EVERY item (not just the first) so "local, claude , manus" parses cleanly.
+    order = [p.strip() for p in
+             os.environ.get("LANDINTEL_LLM_ORDER", "local").split(",")]  # offline-only default
+    provider = _PROVIDER_MAP.get(order[0], "anthropic")
 
     # Feature-detect the registration API (the README documents a @geo_tool decorator + a
     # GeoAgent facade / GeoAgentConfig). Wrap each LandIntel tool; degrade clearly if absent.

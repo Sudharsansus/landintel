@@ -25,7 +25,9 @@ from .concept import AUTO_ACTIONS
 
 _log = logging.getLogger(__name__)
 _CONF = ("ACCEPT", "ACCEPT_SEEDED", "ACCEPT_CADASTRAL")
-_OVERLAP_FRAC = 0.30
+from ..pipeline.m2_club.disposition_thresholds import (  # noqa: E402
+    TILING_OVERLAP_THRESHOLD as _OVERLAP_FRAC,
+)
 
 
 def _footprint(r):
@@ -48,8 +50,8 @@ def _footprint(r):
 def _breaks_fp_invariant(r, results, village) -> str | None:
     """Return a reason string if marking ``r`` confident would violate a global FP
     invariant (overlap with another confident footprint, or cross-village); else None."""
-    from ..pipeline.m2_georef.pipeline import _is_cross_village
-    if village and _is_cross_village(getattr(r, "m1_file", ""), village):
+    from .dispositions import is_cross_village
+    if village and is_cross_village(r, village):
         return "cross-village plot may not be confident"
     fp = _footprint(r)
     if fp is None:

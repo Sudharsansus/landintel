@@ -48,11 +48,19 @@ def _gate_residual(fit) -> float:
 
 # Rigid shape gate (identical bands to the validated M3 cadastral path). A placement
 # is gate-passing ONLY if all hold; otherwise the candidate is still returned but
-# flagged passes_gate=False, so the pipeline surfaces it as REVIEW, never ACCEPT.
-CAD_AREA_LO = 0.65          # placed M1 area / parcel area lower bound (right-sized)
-CAD_AREA_HI = 1.55          # upper bound
-CAD_SCALE_LO = 0.80         # leftover rigid scale (M1 is metres, parcel is metres -> ~1)
-CAD_SCALE_HI = 1.25
+# flagged passes_gate=False, so the pipeline surfaces it at lower confidence.
+# Values centralized in disposition_thresholds (single source; rationale lives there).
+from .disposition_thresholds import (  # noqa: E402
+    CAD_AREA_HI,
+    CAD_AREA_LO,
+    CAD_MIN_STONES,
+    CAD_ROT_K,
+    CAD_ROT_RESID_MAX,
+    CAD_SCALE_HI,
+    CAD_SCALE_LO,
+    SEAT_FLOOR_M,
+    SEAT_K,
+)
 # PLACE AT TRUE SCALE. The fitted scale (~0.95) is the raster cadastre being slightly off, NOT
 # the FMB -- M1 is already real metres, so the survey's true scale to UTM is 1. Baking the
 # fitted scale into the geometry SHRINKS every edge 2-5% (measured: perimeters 0.93-0.99 of
@@ -61,35 +69,10 @@ CAD_SCALE_HI = 1.25
 # exactly preserved), anchored at the fitted centroid. This is the client's "one base point +
 # club the boundary, keep the lengths" directive.
 CAD_RIGID_SCALE = True
-CAD_ROT_RESID_MAX = 12.0    # rigid corner-alignment residual FLOOR (m); gross misfit -> REVIEW
-# The rigid corner-alignment residual is measured against a RASTER-traced parcel polygon
-# (z18 ~0.586 m/px, coarse approxPolyDP corners), so its absolute value scales with parcel
-# size: the same fractional corner jitter is ~3x larger on a 120 m parcel than a 40 m one.
-# A flat 12 m floor under-accepts large-but-correct placements (measured: surveys 668/1024/
-# 1025 fail ONLY rot_residual at 14-24 m while area/scale/orientation AND the seat-locality
-# lock all pass strongly). So the tolerance is FLOORED at CAD_ROT_RESID_MAX and grows with the
-# placed parcel's equivalent radius. This does NOT weaken 0-FP: seat-locality (centroid on its
-# own label) + area band + scale~1 + orientation are the false-positive lock; rot_residual was
-# always redundant for FP rejection (it never stopped the 27 cross-placements -- seat did).
-CAD_ROT_K = 0.30            # rot-residual tolerance per metre of placed equivalent radius
-                            # (within the principled 0.25-0.35 raster-coarseness band; seat-
-                            # locality + area + scale + orientation remain the FP lock)
-# SEAT-LOCALITY GATE -- the decisive 0-FP lock. The rigid shape gate ALONE over-matches in a
-# field of similar-sized blobby parcels (measured: 27/156 wrong cross-placements pass it). The
-# discriminator is that a CORRECT placement seats the M1 plot back ON its own OCR label point.
-# The tolerance is PARCEL-SIZE-RELATIVE (not an absolute metre value, which is too loose for a
-# small urban parcel and too tight for a large rural one): a placement may sit within SEAT_K
-# equivalent-radii of the label (radius = sqrt(area/pi)), floored at SEAT_FLOOR_M for OCR
-# label-point jitter. It only ADDS a rejection; it never promotes. (Resolution/zone-agnostic.)
-SEAT_K = 1.6
-SEAT_FLOOR_M = 60.0
-# MINIMUM CORNER-STONE MATCH for a confident cadastral ACCEPT. A rigid pose (rotation +
-# translation, scale~1) is only well-CONSTRAINED by >= 4 corner correspondences; a 3-stone fit
-# is minimal and a single jittered stone tilts the whole placement (the visible "gap"). So a plot
-# fit with fewer than this is still PLACED (located) but routed to REVIEW, never ACCEPT. All
-# current village plots already carry >= 4 corners, so this tightens the standard without loss.
-# Override via env (LANDINTEL_CAD_MIN_STONES); default 4.
-CAD_MIN_STONES = int(os.environ.get("LANDINTEL_CAD_MIN_STONES", "4"))
+# The residual tolerance is size-relative (floored at CAD_ROT_RESID_MAX, grows CAD_ROT_K
+# per metre of placed equivalent radius), the seat-locality lock is parcel-size-relative
+# (SEAT_K equivalent-radii, floored at SEAT_FLOOR_M), and CAD_MIN_STONES is the
+# well-constrained-pose bar -- full rationale with the constants in disposition_thresholds.
 
 
 def _placed_area(fit, m1) -> float:
@@ -107,6 +90,44 @@ def _rot_resid_tol(placed_area: float) -> float:
     placed parcel's equivalent radius (raster corner jitter scales with parcel size)."""
     eq_radius = float(np.sqrt(max(placed_area, 1.0) / np.pi))
     return max(CAD_ROT_RESID_MAX, CAD_ROT_K * eq_radius)
+
+
+def _stone_match_stats(placed_ring: np.ndarray, parcel) -> tuple[int, int, bool]:
+    """Count placed FMB corners coinciding with the parcel's major corners (one target
+    per corner), against the conditional bar min(FULL_MATCH_STONES, n_corners).
+
+    Measured on the FINAL rigid placement so it reflects the actual output regardless
+    of which fit path won. Size-relative tolerance (see disposition_thresholds).
+    Returns (n_matched, required, full). Confidence LABEL only -- never a gate.
+    """
+    from .disposition_thresholds import (
+        FULL_MATCH_STONES,
+        STONE_TOL_FLOOR_M,
+        STONE_TOL_K,
+    )
+    n = len(placed_ring)
+    required = min(FULL_MATCH_STONES, n)
+    poly = getattr(parcel, "polygon", None)
+    if poly is None or n < 3:
+        return 0, required, False
+    try:
+        from scipy.spatial import cKDTree
+
+        from ..m5_cadastral.fit import _skeleton_corners
+        corners = _skeleton_corners(poly, n)
+        if corners is None or len(corners) < 2:
+            return 0, required, False
+        eq_r = float(np.sqrt(max(poly.area, 1.0) / np.pi))
+        tol = max(STONE_TOL_FLOOR_M, STONE_TOL_K * eq_r)
+        d, idx = cKDTree(np.asarray(corners, float)).query(np.asarray(placed_ring, float))
+        matched_targets: set[int] = set()
+        for di, ji in sorted(zip(np.atleast_1d(d), np.atleast_1d(idx))):
+            if di <= tol and int(ji) not in matched_targets:
+                matched_targets.add(int(ji))
+        n_matched = len(matched_targets)
+        return n_matched, required, n_matched >= required
+    except Exception:  # noqa: BLE001 - a stats failure must never break placement
+        return 0, required, False
 
 
 def _rigidify(fit, m1):
@@ -231,6 +252,12 @@ def cadastral_seat(
             reasons.append(f"rot_resid={fit.rot_residual:.1f}m{robust_note}")
         note = "below cadastral shape gate: " + ", ".join(reasons)
 
+    # Stone-match confidence on the FINAL placement (whatever path produced it):
+    # count placed corners coinciding with the parcel's major corners, against the
+    # conditional bar min(FULL_MATCH_STONES, n_corners). A LABEL, never a gate.
+    n_sm, req_sm, full_sm = _stone_match_stats(
+        adj_p[np.array(m1.outer_stone_indices)], parcel)
+
     return CandidatePlacement(
         method="cadastral",
         R=R_p, s=s_p, t=t_p,
@@ -241,4 +268,7 @@ def cadastral_seat(
         rot_residual=fit.rot_residual,
         scale=float(fit.s),          # report the FITTED scale (diagnostic); placement is rigid
         note=note,
+        n_stone_matched=n_sm,
+        stones_required=req_sm,
+        full_stone_match=full_sm,
     )

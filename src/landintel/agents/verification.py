@@ -21,7 +21,12 @@ from __future__ import annotations
 from .base import Agent, AgentReport, Check, Severity
 from .dispositions import VALID_STATES, normalize
 
-_FOOTPRINT_CONFLICT = 0.20   # interiors overlapping more than this = mutually-exclusive parcels
+# Interiors overlapping more than this = mutually-exclusive parcels. Centralized:
+# this agent previously pinned 0.20 while the re-gate/assembly path used 0.30 --
+# a silent FP-policy drift; all four consumers now share ONE constant.
+from ..pipeline.m2_club.disposition_thresholds import (  # noqa: E402
+    TILING_OVERLAP_THRESHOLD as _FOOTPRINT_CONFLICT,
+)
 
 
 class VerificationAgent(Agent):
@@ -123,17 +128,5 @@ class VerificationAgent(Agent):
         return rep
 
 
-def _is_cross_village(d, village) -> bool:
-    """True only on a clear FMB-village vs cadastre-village mismatch. Conservative: if
-    the village can't be parsed (synthetic fixtures, no surveyor context), returns False
-    so nothing is spuriously rejected. Delegates to the m2_georef parser when available."""
-    if not village or not d.m1_file:
-        return False
-    try:
-        from ..pipeline.m2_georef.pipeline import _is_cross_village as _xv
-    except Exception:  # noqa: BLE001
-        return False
-    try:
-        return bool(_xv(d.m1_file, village))
-    except Exception:  # noqa: BLE001
-        return False
+# Single-source cross-village check (see dispositions.is_cross_village).
+from .dispositions import is_cross_village as _is_cross_village  # noqa: E402

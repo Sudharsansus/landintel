@@ -140,14 +140,5 @@ class LLMAssistAgent(Agent):
                 f"input to finish (see input_requests.json); none were placed incorrectly.")
 
 
-def _is_cross_village(d, village) -> bool:
-    if not village or not d.m1_file:
-        return False
-    try:
-        from ..pipeline.m2_georef.pipeline import _is_cross_village as _xv
-    except Exception:  # noqa: BLE001
-        return False
-    try:
-        return bool(_xv(d.m1_file, village))
-    except Exception:  # noqa: BLE001
-        return False
+# Single-source cross-village check (see dispositions.is_cross_village).
+from .dispositions import is_cross_village as _is_cross_village  # noqa: E402

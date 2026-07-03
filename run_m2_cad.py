@@ -261,8 +261,11 @@ def main() -> None:
     print(f"      -> chosen village block @ {chosen.get('center')} span={chosen.get('span_m')}m "
           f"(TNGIS-overlay IoU={_score[0]}, ACCEPT={_score[1]})")
 
-    print("[4/4] quality pass: edge-align + corner-snap (0-FP)...")
-    snap_and_rewrite(results, out, crs=CRS, enable=True, tol=8.0)
+    print("[4/4] quality pass: edge-align + corner-snap + club-all reseat (0-FP)...")
+    # club_all: M2 is a REFERENCE for the surveyor -- every placed plot ships in the ONE
+    # main club; low-confidence plots additionally take the full gap toward confident
+    # neighbours' shared edges (translation-only, capped, overlap-reverted).
+    snap_and_rewrite(results, out, crs=CRS, enable=True, tol=8.0, club_all=True)
 
     # --- Agent verification of the chosen club (each agent owns one job, 0-FP) ---
     fps = {r.survey_number: r.placement.footprint() for r in results if r.placement}
@@ -403,31 +406,45 @@ def main() -> None:
     print(f"\nPLACED: {len(placed)}/{len(results)} onto cadastral parcels  "
           f"(clubbed FMB<->TNGIS mean IoU {ov['mean_iou']:.2f})")
 
-    # RE-CLUB with the FINAL dispositions. snap_and_rewrite ran at [4/4] BEFORE the IoU/
-    # containment/stone promotions, so its clubbed DXF reflected the stale (pre-promotion)
-    # recommendations. Rebuild now from the finalized set, reusing the already-snapped per-plot
-    # georef DXFs: the MAIN clubbed_village.dxf is the clean ACCEPT tiling; REVIEW plots (which
-    # diverge from the cadastre and overlap) go to a SEPARATE clubbed_review.dxf so they no longer
-    # pile onto the map. ACCEPT-only villages are unchanged.
+    # RE-CLUB with the FINAL dispositions -- CLUB-ALL MODE (client directive 2026-07-03:
+    # "M2 output is a reference for the surveyor; club all with 0 review, max accuracy").
+    # snap_and_rewrite ran at [4/4] BEFORE the IoU/containment/stone promotions, so rebuild
+    # from the finalized set, reusing the already-snapped per-plot georef DXFs. EVERY placed
+    # plot goes into the ONE clubbed_village.dxf: the confident tiling as FMB_<sn> blocks and
+    # the best-effort (divergent-cadastre / under-constrained) plots as FMB_<sn>_LOWCONF
+    # blocks. The gates still ran -- their verdicts became the confidence TIER, not an
+    # exclusion. Precision is M3's job (surveyor data); M2 maximizes completeness.
     from landintel.pipeline.m2_club.club_output import club_dxf
     placed_specs = [(r.output_file, r.survey_number) for r in results
                     if r.recommendation in ("ACCEPT", "ACCEPT_SEEDED")
                     and r.output_file and Path(r.output_file).exists()]
-    review_specs = [(r.output_file, r.survey_number) for r in results
-                    if r.recommendation == "REVIEW"
-                    and r.output_file and Path(r.output_file).exists()]
+    lowconf_specs = [(r.output_file, r.survey_number) for r in results
+                     if r.recommendation == "REVIEW"
+                     and r.output_file and Path(r.output_file).exists()]
     # CLIENT RULE: the FMB scale / edge lengths / properties are NEVER changed while matching
     # stones and clubbing. So the clubbed map keeps each plot's OWN rigid-placed FMB boundary
     # (edge lengths preserved exactly); neighbours are aligned only by their shared STONES
     # (snap_shared_boundaries), never warped onto the cadastre. (The cadastre-boundary override
     # was rejected: it rewrote the FMB boundary.)
-    club_dxf(placed_specs, [], out / "clubbed_village.dxf", crs=CRS, review_specs=None)
+    club_dxf(placed_specs, [], out / "clubbed_village.dxf", crs=CRS,
+             review_specs=None, lowconf_specs=lowconf_specs)
     rev_path = out / "clubbed_review.dxf"
-    if review_specs:
-        club_dxf(review_specs, [], rev_path, crs=CRS)
-        print(f"Review DXF  : {rev_path} ({len(review_specs)} lower-confidence/divergent plots)")
-    elif rev_path.exists():
-        rev_path.unlink()
+    if rev_path.exists():
+        rev_path.unlink()                      # club-all: no separate review file
+
+    # Confidence tiers for the deliverable (labels, not exclusions):
+    #   HIGH   = confident placement + full conditional stone match (min(5, n_corners))
+    #   MEDIUM = confident placement (gate-passed / corroborated / containment)
+    #   LOW    = best-effort placement (FMB diverges from the current cadastre, or
+    #            under-constrained) -- clubbed at its best position, flagged for M3
+    n_high = sum(1 for r in results if r.placed and r.placement is not None
+                 and getattr(r.placement, "full_stone_match", False))
+    n_med = sum(1 for r in results if r.placed) - n_high
+    n_low = len(lowconf_specs)
+    n_clubbed = len(placed_specs) + n_low
+    print(f"\nCLUB-ALL    : {n_clubbed}/{len(results)} FMBs clubbed into ONE file "
+          f"(HIGH {n_high} / MEDIUM {n_med} / LOW {n_low}) -- review 0, "
+          f"nothing withheld; LOW = FMB-vs-cadastre divergence, resolved by M3")
     # Re-write the companion geojson/csv from the SNAPPED placements (snap_and_rewrite wrote them
     # pre-snap / pre-promotion, so they were stale).
     from landintel.pipeline.m2_club.club_output import write_geojson, write_points_csv

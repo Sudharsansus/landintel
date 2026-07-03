@@ -87,8 +87,38 @@ class PlotDisposition:
                 self.raw.recommendation = "REVIEW"
                 prev = getattr(self.raw, "note", "")
                 self.raw.note = (prev + "; " if prev else "") + note
-            except Exception:  # noqa: BLE001 - never crash on a read-only/odd result
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # FP-SAFETY: if the mirror-write fails, the disposition says REVIEW
+                # while the raw result still says ACCEPT -- the orchestrator would
+                # ship a plot an invariant just demoted. That divergence must be
+                # LOUD, never swallowed.
+                _log.warning(
+                    "PlotDisposition.demote mirror-write FAILED for survey=%s "
+                    "(disposition is REVIEW; raw still says %s). The deliverable "
+                    "set would silently diverge from the verified set: %r",
+                    self.survey, getattr(self.raw, "recommendation", "?"), exc)
+                raise
+
+
+def is_cross_village(d, village: str | None) -> bool:
+    """Single source of truth for the cross-village check (drift between the three
+    per-agent copies was an FP loophole -- one copy could silently diverge).
+
+    True only on a clear FMB-village vs cadastre-village mismatch. Conservative: if
+    the village can't be parsed (synthetic fixtures, no surveyor context) or the
+    pipeline parser is unavailable, returns False so nothing is spuriously rejected.
+    Delegates to the m2_georef parser, which owns the filename convention.
+    """
+    if not village or not getattr(d, "m1_file", ""):
+        return False
+    try:
+        from ..pipeline.m2_georef.pipeline import _is_cross_village as _xv
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        return bool(_xv(d.m1_file, village))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # ----------------------------------------------------------------- adapters ------

@@ -12,7 +12,7 @@ by the deterministic math gates, so **no agent can ever produce a false positive
 | `GuardAgent` | `guard.py` | Deterministic final-line FP guards (e.g. 180° anagram trap). |
 | `InputRequestAgent` | `input_request.py` | The MINIMAL extra input that closes each unplaced plot → 100%. |
 | `LLMAssistAgent` | `llm_assist.py` | Local Qwen + Claude combo for fuzzy tasks; never decides. |
-| **`CoordinateFinderAgent`** | `coordinate_finder.py` | **NEW.** Finds a village's EXACT lat/lon automatically: rough web geocode → refine to the TNGIS cadastre village centroid by survey number. Replaces manual `--lat/--lon`. |
+| **`CoordinateFinderAgent`** | `coordinate_finder.py` | Finds a village's EXACT lat/lon automatically: ALL geocode candidates (homonym-safe) → refine to the TNGIS cadastre village by survey-number COVERAGE (fraction of the FMB's own survey list; `high` only when decisive: ≥0.5 and ≥1.5× runner-up), widening the search if nothing is decisive. The fingerprint decides; the pin only proposes. Replaces manual `--lat/--lon`. |
 | support | `concept.py`, `dispositions.py`, `geoagent_adapter.py`, `geojson.py`, `orchestrator.py`, `regate.py`, `tools.py` | shared helpers / the re-gate + disposition glue. |
 
 ## B. Pipeline (M2-club) agents — `src/landintel/agents/club_agents.py` (moved here 2026-07-03)

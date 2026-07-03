@@ -153,6 +153,7 @@ def align_shared_edges(
     move_cap: float | None = None,
     new_overlap_max: float = NEW_OVERLAP_MAX,
     fixed: set[str] | None = None,
+    recs: tuple[str, ...] | None = None,
 ) -> AlignStats:
     """Translate ACCEPT plots toward their corroborated shared boundaries (rigid).
 
@@ -168,9 +169,19 @@ def align_shared_edges(
     surveyor stones): they never move, and a neighbour sharing an edge with an anchor
     takes the FULL correction toward it -- so accurate placement PROPAGATES outward from
     the stone-matched plots (the client's relative FMBS_STONES_MATCH).
+
+    ``recs`` widens which recommendations participate (default: the placed ACCEPT set).
+    Club-all M2 passes ``("ACCEPT", "ACCEPT_SEEDED", "REVIEW")`` with ``fixed`` = the
+    confident set, so a LOW-confidence plot takes the full gap toward its confident
+    neighbours (the corroborated reseat) while the confident tiling itself never moves.
+    All the same guards apply: translation-only, size-relative caps, overlap-revert.
     """
-    placed = [r for r in results if r.placed and r.placement is not None
-              and len(_ring_pts(r.placement)) >= 3]
+    if recs is None:
+        placed = [r for r in results if r.placed and r.placement is not None
+                  and len(_ring_pts(r.placement)) >= 3]
+    else:
+        placed = [r for r in results if r.recommendation in recs
+                  and r.placement is not None and len(_ring_pts(r.placement)) >= 3]
     stats = AlignStats(n_plots=len(placed))
     if len(placed) < 2:
         return stats

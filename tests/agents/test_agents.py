@@ -211,3 +211,102 @@ def test_verification_flags_cross_village_confident():
     assert rep.failed
     assert any(c.name == "fp_no_cross_village_in_confident"
                and c.severity == Severity.FAIL for c in rep.checks)
+
+
+# ------------------------------------------- A2: demote mirror-write must be LOUD --
+def test_demote_mirror_write_failure_raises(caplog):
+    # If the raw result refuses the REVIEW mirror-write, the disposition and the
+    # deliverable set silently diverge (verified-REVIEW vs shipped-ACCEPT). That
+    # must raise, never pass.
+    import logging
+
+    import pytest
+
+    from landintel.agents.dispositions import PlotDisposition
+
+    class _FrozenRaw:
+        recommendation = "ACCEPT"
+
+        @property
+        def note(self):
+            return ""
+
+        @note.setter
+        def note(self, _):
+            raise AttributeError("frozen")
+
+    d = PlotDisposition(survey="X", recommendation="ACCEPT", raw=_FrozenRaw())
+    with caplog.at_level(logging.WARNING, logger="landintel.agents.dispositions"):
+        with pytest.raises(AttributeError):
+            d.demote("test failure")
+    assert any("mirror-write FAILED" in r.message for r in caplog.records)
+
+
+def test_demote_never_promotes_and_mirrors_on_success():
+    from landintel.agents.dispositions import PlotDisposition
+
+    class _Raw:
+        recommendation = "ACCEPT"
+        note = ""
+
+    raw = _Raw()
+    d = PlotDisposition(survey="Y", recommendation="ACCEPT", raw=raw)
+    d.demote("overlap")
+    assert d.recommendation == "REVIEW" and raw.recommendation == "REVIEW"
+    # demoting a non-confident plot is a no-op (never promotes, never flips states)
+    d2 = PlotDisposition(survey="Z", recommendation="NO_COVERAGE")
+    d2.demote("noop")
+    assert d2.recommendation == "NO_COVERAGE"
+
+
+# --------------------------------------- A3: single-source cross-village helper --
+def test_is_cross_village_helper_is_shared():
+    import inspect
+
+    from landintel.agents import dispositions, input_request, llm_assist, verification
+
+    assert hasattr(dispositions, "is_cross_village")
+    for mod in (verification, input_request, llm_assist):
+        # the local 9-line copies are gone; each module aliases the shared one
+        assert mod._is_cross_village is dispositions.is_cross_village
+        assert "def _is_cross_village" not in inspect.getsource(mod)
+
+
+def test_is_cross_village_conservative_defaults():
+    from landintel.agents.dispositions import PlotDisposition, is_cross_village
+
+    d = PlotDisposition(survey="1", recommendation="REVIEW")   # no m1_file
+    assert is_cross_village(d, "INGUR") is False               # conservative
+    assert is_cross_village(d, None) is False
+    d2 = PlotDisposition(
+        survey="9", recommendation="REVIEW",
+        m1_file="test2/INGUR/m1_outputs/FMB_ERODE_PERUNDURAI_KANDAMPALAYAM _9.dxf")
+    assert is_cross_village(d2, "INGUR") is True               # real mismatch caught
+
+
+# ------------------------------------------------- A4: AGENTS BEGIN summary log --
+def test_run_agent_layer_logs_survey_summary(tmp_path, caplog):
+    import logging
+
+    from landintel.agents.orchestrator import run_agent_layer
+
+    results = [_r("763", "ACCEPT_CADASTRAL", "cadastral_rigid", 1.0, 2.0),
+               _r("668", "REVIEW", "cadastral_rigid_located", 0.78, 19.0)]
+    with caplog.at_level(logging.INFO, logger="landintel.agents.orchestrator"):
+        run_agent_layer(results, tmp_path,
+                        {"village": "INGUR", "enable_auto_regate": False,
+                         "enable_memory": False})
+    assert any("AGENTS BEGIN" in r.message and "763" in r.message
+               and "668" in r.message for r in caplog.records)
+
+
+# --------------------------------------------- A7: LLM_ORDER strips every item --
+def test_llm_order_env_all_items_stripped(monkeypatch):
+    # The adapter must strip EVERY item so "local, claude , manus" parses cleanly.
+    import inspect
+
+    from landintel.agents import geoagent_adapter
+
+    src = inspect.getsource(geoagent_adapter.build_geoagent)
+    assert "p.strip() for p in" in src            # strip applied per-item
+    assert "order[0].strip()" not in src          # not just the first

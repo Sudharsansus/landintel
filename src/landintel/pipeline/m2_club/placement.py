@@ -33,6 +33,12 @@ class CandidatePlacement:
     scale: float = 1.0
     seed_ok: bool = True
     note: str = ""
+    # Stone-match confidence (client's conditional "5 stones" bar): how many placed
+    # corners coincide with target stones, out of min(FULL_MATCH_STONES, n_corners).
+    # A CONFIDENCE LABEL, never a placement blocker (club-all M2 places everything).
+    n_stone_matched: int = 0
+    stones_required: int = 0
+    full_stone_match: bool = False
 
     def corner_points(self) -> np.ndarray:
         """(M, 2) placed corner-ring positions in UTM."""

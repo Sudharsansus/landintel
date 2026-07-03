@@ -23,6 +23,8 @@ from typing import Any
 from shapely.geometry import Polygon
 from shapely.ops import unary_union
 
+from ..pipeline.m2_club.disposition_thresholds import TILING_OVERLAP_THRESHOLD
+
 
 def overlay_gate(recommendation: str, iou: float | None, *,
                  seated: bool, has_placement: bool, in_demote: bool,
@@ -180,7 +182,7 @@ class AssemblyAgent:
 
     def run(self, footprints: dict[str, Polygon], accepted: set[str],
             confidence: dict[str, float] | None = None,
-            max_overlap_frac: float = 0.3) -> AgentResult:
+            max_overlap_frac: float = TILING_OVERLAP_THRESHOLD) -> AgentResult:
         confidence = confidence or {}
         demote: set[str] = set()
         acc = sorted(accepted)

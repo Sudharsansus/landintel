@@ -41,16 +41,27 @@ _UA = {"User-Agent": "landintel-geolocate/1.0 (cadastral survey mapping)"}
 # --------------------------------------------------------------------------- #
 def geocode(query: str) -> tuple[float, float] | None:
     """Return (lat, lon) for a free-text place query via Nominatim, or None."""
+    c = geocode_candidates(query, limit=1)
+    return c[0] if c else None
+
+
+def geocode_candidates(query: str, limit: int = 5) -> list[tuple[float, float]]:
+    """ALL (lat, lon) candidates for a place query via Nominatim, best-first.
+
+    TN village names recur (homonym villages) -- taking only the first hit silently
+    picks the wrong one (measured: MOOLAKARAI resolved to a same-named village 15+ km
+    east). Callers that hold an independent fingerprint (the FMB survey numbers)
+    should score EVERY candidate and let the fingerprint decide; the pin is a hint.
+    """
     try:
         url = _NOMINATIM + "?" + urllib.parse.urlencode(
-            {"q": query, "format": "json", "limit": 1})
+            {"q": query, "format": "json", "limit": int(limit)})
         req = urllib.request.Request(url, headers=_UA)
         r = json.load(urllib.request.urlopen(req, timeout=20))
-        if r:
-            return float(r[0]["lat"]), float(r[0]["lon"])
+        return [(float(e["lat"]), float(e["lon"])) for e in r]
     except Exception as exc:  # noqa: BLE001
-        _log.debug("geocode(%r) failed: %s", query, exc)
-    return None
+        _log.debug("geocode_candidates(%r) failed: %s", query, exc)
+    return []
 
 
 def rough_center(village: str, taluk: str = "", district: str = "",

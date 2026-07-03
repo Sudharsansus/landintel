@@ -218,6 +218,17 @@ _RESID_TIE_FACTOR = 1.35
 _RESID_TIE_FLOOR_M = 2.0
 
 
+# NOTE (2026-07-03, virtual-corner investigation): the proposed "synthesize a virtual
+# 4th corner for 3-corner umeyama seeds" fix was implemented, MEASURED, and REJECTED.
+# Any derived corner is an affine combination of the real ones, so it adds ZERO new
+# information (the 3-point umeyama is already the optimal estimator for its
+# correspondence); it only REWEIGHTS noise -- and for jitter on the reflected corner
+# the +eps/-eps pair at centroid-opposite positions forms a pure torque couple that
+# ~doubles the worst-case angular error (measured 1.0 deg -> 1.9 deg on a planted 5 m
+# jitter). The real 3-corner stabilizers are already below: ICP refinement against the
+# densified parcel boundary + the IoU tie-break. Do not reintroduce.
+
+
 def _rigid_from_parcel(m1_ring: np.ndarray, parcel: CadastralParcel):
     """Best RIGID (rotation+scale+translation) aligning the M1 corner ring to the
     parcel boundary -- a cyclic-Procrustes initial guess refined by 2D ICP. Rigid
@@ -268,6 +279,29 @@ def _rigid_from_parcel(m1_ring: np.ndarray, parcel: CadastralParcel):
             continue
         iou = _placed_iou(m1_ring, R, s, t, parcel_poly)
         refined.append((resid, iou, R, s, t))
+
+    # CLIENT-APPROACH candidate (base stone + rotation search, scale LOCKED to 1):
+    # the unified rigid stone-matcher tries every FMB corner as the base point
+    # against the parcel's major corners and keeps the pose matching the most
+    # stones. It competes in the SAME residual+IoU pool as the ICP seeds -- one
+    # selection rule, no special-casing -- and, being scale-1 by construction, it
+    # preserves FMB edge lengths exactly.
+    try:
+        from ..m2_club.disposition_thresholds import STONE_TOL_FLOOR_M, STONE_TOL_K
+        from ..m2_georef.stone_matcher import rigid_stone_match
+        from scipy.spatial import cKDTree
+        eq_r = math.sqrt(max(parcel.polygon.area, 1.0) / math.pi)
+        tol = max(STONE_TOL_FLOOR_M, STONE_TOL_K * eq_r)
+        sm = rigid_stone_match(m1_ring, np.asarray(par, float), tol_m=tol)
+        if sm is not None and sm.n_matched >= 3:
+            cur = m1_ring @ sm.R.T + sm.t
+            d, _ = cKDTree(target).query(cur)
+            refined.append((float(d.mean()),
+                            _placed_iou(m1_ring, sm.R, 1.0, sm.t, parcel_poly),
+                            sm.R, 1.0, sm.t))
+    except Exception:  # noqa: BLE001 - the ICP path stands alone if this fails
+        pass
+
     if not refined:
         return None
 

@@ -15,7 +15,7 @@ the deterministic math gates, so no agent can ever produce a false positive.
 from .base import Agent, AgentReport, Check, InputRequest, InputType, Severity
 from .dispositions import (
     CONFIDENT, VALID_STATES, PlotDisposition, from_club_result, from_georef_result,
-    normalize,
+    is_cross_village, normalize,
 )
 from .orchestrator import run_agent_layer
 
@@ -23,5 +23,5 @@ __all__ = [
     "Agent", "AgentReport", "Check", "InputRequest", "InputType", "Severity",
     "run_agent_layer",
     "PlotDisposition", "from_club_result", "from_georef_result", "normalize",
-    "CONFIDENT", "VALID_STATES",
+    "CONFIDENT", "VALID_STATES", "is_cross_village",
 ]

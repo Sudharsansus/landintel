@@ -42,6 +42,15 @@ def run_agent_layer(results, output_dir, context: dict | None = None) -> dict:
             _log.error("Memory graph unavailable: %s", exc)
     graph = context.get("memory_graph")
 
+    # One grep-able line per job so an operator can follow a plot through every agent.
+    _log.info(
+        "AGENTS BEGIN: village=%s n_plots=%d surveys=%s",
+        context.get("village", "?"),
+        len(results),
+        sorted({str(getattr(r, "survey_number", getattr(r, "survey", "?")))
+                for r in results})[:25]
+        + (["..."] if len(results) > 25 else []))
+
     agents = [VerificationAgent(), GuardAgent(), InputRequestAgent(), LLMAssistAgent()]
     reports = []
     for a in agents:

@@ -113,11 +113,15 @@ def club_dxf(
     output_path,
     crs: str = DEFAULT_CRS,
     review_specs: list[tuple[str, str]] | None = None,
+    lowconf_specs: list[tuple[str, str]] | None = None,
 ) -> Path:
     """Club FMBs into one DXF (no surveyor base).
 
     placed_specs  : [(georef_dxf_path, survey)]  merged at their UTM position.
     review_specs  : [(georef_dxf_path, survey)]  merged at UTM, own REVIEW_FMB_<s> layer.
+    lowconf_specs : [(georef_dxf_path, survey)]  merged at UTM with NORMAL layers, block
+                    named FMB_<s>_LOWCONF -- the club-all M2 tier for best-effort plots
+                    (traceable in CAD without the "review" framing; M2 is a reference).
     staged_specs  : [(m1_dxf_path, survey)]      no UTM control -> grid band, RED layer.
     """
     output_path = Path(output_path)
@@ -152,6 +156,17 @@ def club_dxf(
         # The block name still encodes REVIEW_FMB_<sn> for traceability in CAD.
         _import_as_block(base, src, f"REVIEW_FMB_{sn}")
         n_review += 1
+
+    n_lowconf = 0
+    for gp, sn in (lowconf_specs or []):
+        try:
+            src = ezdxf.readfile(str(gp))
+        except Exception:  # noqa: BLE001
+            continue
+        # Club-all tier: georeferenced at its best-effort position, normal layers,
+        # selectable as one block; the _LOWCONF suffix carries the confidence label.
+        _import_as_block(base, src, f"FMB_{sn}_LOWCONF")
+        n_lowconf += 1
 
     # Stage the uncontrolled plots in a labelled grid EAST of the placed cluster.
     n_staged = 0
@@ -209,8 +224,8 @@ def club_dxf(
                 n_staged += 1
 
     output_path = _safe_saveas(base, output_path)
-    _log.info("Clubbed M2 DXF: %s (%d placed + %d review + %d staged)",
-              output_path, n_placed, n_review, n_staged)
+    _log.info("Clubbed M2 DXF: %s (%d placed + %d lowconf + %d review + %d staged)",
+              output_path, n_placed, n_lowconf, n_review, n_staged)
     return output_path
 
 
@@ -278,6 +293,7 @@ def snap_and_rewrite(
     enable: bool = True,
     tol: float = DEFAULT_TOL,
     truth_stones=None,
+    club_all: bool = False,
 ) -> SnapStats:
     """Snap shared boundaries of adjacent ACCEPT plots, then RE-WRITE every clubbed
     deliverable so the DXF / GeoJSON / CSV all reflect the edge-sharing geometry.
@@ -328,6 +344,24 @@ def snap_and_rewrite(
     fixed = anchored or None
     align = align_shared_edges(results, fixed=fixed)
     stats = snap_shared_boundaries(results, tol=tol, fixed=fixed)
+
+    # CLUB-ALL corroborated reseat (M2-as-reference mode): LOW-confidence placed
+    # plots take the FULL gap toward their confident neighbours' shared edges --
+    # the client's stone/edge tie realized by REUSING the validated edge_align
+    # machinery (translation-only, size-relative caps, overlap-revert), with the
+    # confident tiling pinned via ``fixed`` so it never moves toward a weak plot.
+    if club_all:
+        confident = {r.survey_number for r in results
+                     if r.placed and r.placement is not None}
+        n_low = sum(1 for r in results
+                    if r.recommendation == "REVIEW" and r.placement is not None)
+        if confident and n_low:
+            low_align = align_shared_edges(
+                results, recs=("ACCEPT", "ACCEPT_SEEDED", "REVIEW"),
+                fixed=confident | (anchored or set()))
+            _log.info("club-all reseat: %d low-conf plots, %d shared-edge constraints,"
+                      " %d moved (max %.1f m)", n_low, low_align.n_constraints,
+                      low_align.n_moved, low_align.max_move)
     if anchored:
         # Final 0-FP guard: revert any plot that ended up stacked on another to its clean
         # cadastre seat, so the delivered set is a non-overlapping tiling.
@@ -358,16 +392,23 @@ def snap_and_rewrite(
         else:
             staged_specs.append((r.m1_file, r.survey_number))
 
-    # The MAIN clubbed village is the clean, confidently-placed ACCEPT tiling only. REVIEW plots
-    # are (by definition) lower-confidence -- for these villages that means the FMB extent
-    # DIVERGES from the current cadastre, so they overlap their neighbours and cannot tile. Keeping
-    # them in the main map is exactly what made KANDAMPALAYAM read as "scattered / dumped". They
-    # are still delivered (per-plot georef_<>.dxf + a separate clubbed_review.dxf) for field
-    # verification, just not piled onto the clean tiling. ACCEPT-only villages are unchanged.
-    club_dxf(placed_specs, staged_specs, output_dir / "clubbed_village.dxf",
-             crs=crs, review_specs=None)
-    if review_specs:
-        club_dxf(review_specs, [], output_dir / "clubbed_review.dxf", crs=crs)
+    if club_all:
+        # CLUB-ALL (M2 = reference for the surveyor): EVERY placed plot goes into the
+        # ONE main club at its best-effort position -- no separate review file, no
+        # withheld plots. Confidence is carried as a LABEL (FMB_<sn>_LOWCONF blocks +
+        # the tier column in clubbed_points.csv), never as an exclusion. Precision is
+        # M3's job (surveyor data); M2 maximizes completeness + best-effort accuracy.
+        club_dxf(placed_specs, staged_specs, output_dir / "clubbed_village.dxf",
+                 crs=crs, review_specs=None, lowconf_specs=review_specs)
+    else:
+        # STRICT mode: the main clubbed village is the clean, confidently-placed ACCEPT
+        # tiling only; lower-confidence plots go to a separate clubbed_review.dxf
+        # (keeping them in the main map is what made a divergent village read as
+        # "scattered / dumped"). ACCEPT-only villages are unchanged either way.
+        club_dxf(placed_specs, staged_specs, output_dir / "clubbed_village.dxf",
+                 crs=crs, review_specs=None)
+        if review_specs:
+            club_dxf(review_specs, [], output_dir / "clubbed_review.dxf", crs=crs)
     write_geojson(results, output_dir / "clubbed.geojson", crs=crs)
     write_points_csv(results, output_dir / "clubbed_points.csv", crs=crs)
     return stats
