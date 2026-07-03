@@ -101,6 +101,7 @@ def _drop_boundary_totals(
     anchored: list,
     ppm: float,
     *,
+    boundary_segments: list | None = None,
     ratio_thresh: float = 1.4,
     angle_tol_deg: float = 12.0,
     perp_tol_m: float = 6.0,
@@ -109,19 +110,21 @@ def _drop_boundary_totals(
 
     An FMB prints both the per-segment boundary values (45, 55, 60 …) and the
     sum of them across the whole corner-to-corner edge (160).  We drop only that
-    sum, and only on boundary lines, using two conditions that together give
-    zero false positives on the fixtures:
+    sum, and only on boundary lines.  A candidate is any boundary value that is
+    ``> ratio_thresh x its own anchored line length`` (condition 1 — a real
+    segment value ~equals its own line, so a span total stands out).  It is then
+    confirmed a total if EITHER:
 
-    1. ``value > ratio_thresh x its anchored line length`` — a real segment value
-       equals its own line length (ratio ~1.0); only a span total (or a mis-
-       anchored long edge) exceeds it.
-    2. ``value ≈ sum of >=2 OTHER boundary values whose anchored lines are
-       collinear`` (same direction within ``angle_tol_deg`` and lying on the same
-       infinite line within ``perp_tol_m``) and each smaller than ``value``.
+      2a. VECTOR span (recall-independent, primary): the value ≈ the metric length
+          of the collinear boundary RUN it sits on, summed from the ``boundary_segments``
+          VECTOR lengths — no dependence on the neighbour values being OCR'd.
+      2b. OCR sum (the original signal): value ≈ sum of >=2 OTHER collinear boundary
+          VALUES each smaller than it.
 
-    A real long edge satisfies (1) but not (2) — its collinear neighbours do not
-    sum to it — so it is kept.  An edge whose segments were not all OCR'd simply
-    fails (2) and the total is kept rather than risk a wrong drop.
+    0-FP: a real segment value equals its OWN short line, so it fails condition 1 and is never a
+    candidate; only a genuine span total reaches 2a/2b and matches the full-run length.  Before,
+    at ~24% OCR recall the segments were rarely all read so 2b missed most totals; 2a fixes that
+    from the vector geometry.
     """
     items = [(am, _parse_meas_value(am.text)) for am in anchored]
 
@@ -139,6 +142,22 @@ def _drop_boundary_totals(
             return math.hypot(mx - line.start[0], my - line.start[1])
         return abs((mx - line.start[0]) * dy - (my - line.start[1]) * dx) / seg
 
+    def _vector_run_len_m(anchor_line) -> float:
+        """Metric length of the collinear boundary RUN the anchor sits on, from VECTOR
+        segments (all boundary strokes, not just the OCR'd ones)."""
+        if not boundary_segments:
+            return 0.0
+        a0 = seg_angle(anchor_line)
+        total_px = 0.0
+        for s in boundary_segments:
+            ad = abs(((seg_angle(s) - a0 + 90.0) % 180.0) - 90.0)
+            if ad > angle_tol_deg:
+                continue
+            if perp_mid_dist(s, anchor_line) * ppm > perp_tol_m:
+                continue
+            total_px += math.hypot(s.end[0] - s.start[0], s.end[1] - s.start[1])
+        return total_px * ppm
+
     drop: set[int] = set()
     for i, (am, val) in enumerate(items):
         if am.line_class != "boundary" or val is None or val <= 0:
@@ -148,6 +167,13 @@ def _drop_boundary_totals(
         ) * ppm
         if length_m < 1e-6 or val <= ratio_thresh * length_m:
             continue  # condition 1: must be much longer than its anchored line
+        # 2a. VECTOR span (recall-independent): value ~= the full collinear boundary run length.
+        run_m = _vector_run_len_m(am.line)
+        if run_m > ratio_thresh * length_m and abs(run_m - val) <= max(2.0, 0.08 * val):
+            drop.add(i)
+            _log.info("drop boundary total (vector run): %s ~= %.1f m span", am.text, run_m)
+            continue
+        # 2b. OCR sum (original): value ~= sum of >=2 collinear neighbour VALUES.
         a0 = seg_angle(am.line)
         neighbours: list[float] = []
         for j, (am2, v2) in enumerate(items):
@@ -162,7 +188,7 @@ def _drop_boundary_totals(
         if len(neighbours) >= 2 and abs(sum(neighbours) - val) <= max(2.0, 0.05 * val):
             drop.add(i)
             _log.info(
-                "drop boundary total: %s = Σ%s", am.text,
+                "drop boundary total (OCR sum): %s = Σ%s", am.text,
                 "+".join(f"{n:g}" for n in sorted(neighbours)),
             )
     return [am for k, (am, _) in enumerate(items) if k not in drop]
@@ -697,8 +723,10 @@ def build_plot(
         cx, cy = _transform(_snap_stone(stone, connecting), ppm, page_height)
         corner_points.append(CornerPoint(label=label, x=cx, y=cy))
 
-    # Drop boundary edge totals (e.g. 160 = 45+55+60) — boundary lines only.
-    anchored = _drop_boundary_totals(anchor_result.anchored, ppm)
+    # Drop boundary edge totals (e.g. 160 = 45+55+60) — boundary lines only. The VECTOR-run
+    # check (boundary_segments) catches totals even when the segment values were not all OCR'd.
+    anchored = _drop_boundary_totals(anchor_result.anchored, ppm,
+                                     boundary_segments=list(vectors.boundary))
 
     measurements = [
         Measurement(
