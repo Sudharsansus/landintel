@@ -13,6 +13,7 @@ import pytest
 from landintel.pipeline.m2_georef.extract_m1 import extract_m1_dxf
 from landintel.pipeline.m2_georef.extract_surveyor import (
     BOUNDARY_CODES,
+    _is_boundary_code,
     extract_surveyor,
 )
 
@@ -58,7 +59,11 @@ def test_extract_real_surveyor():
 
     # ~522 boundary stones (B/BS/RBS/VBS/RB/RS), per the field file.
     assert 500 < len(surv.stones) < 540
-    assert all(s.code in BOUNDARY_CODES for s in surv.stones)
+    # Every extracted stone resolves to a boundary code -- including legitimate COMPOUND
+    # codes like "VBS-RBS" (a stone that is both), which the general _is_boundary_code
+    # accepts by hyphen/space-splitting. A strict `code in BOUNDARY_CODES` would wrongly
+    # reject that real field stone; the predicate is the single source of truth.
+    assert all(_is_boundary_code(s.code) for s in surv.stones)
 
     # 130 SITE DATA LINE polylines traced into chains.
     assert len(surv.polylines) == 130
