@@ -107,29 +107,12 @@ def _msp_extent(doc):
             float(bb.extmax.x), float(bb.extmax.y))
 
 
-def _override_boundary(src, poly) -> None:
-    """Replace the placed plot's BOUNDARY polyline(s) with the exact cadastre parcel outline, so
-    the clubbed map shows the single shared TNGIS edge (perfect tiling) instead of two near-but-
-    not-coincident FMB survey lines. Interior detail (stones/labels/dims) is untouched."""
-    if poly is None or poly.is_empty:
-        return
-    msp = src.modelspace()
-    for e in list(msp.query('LWPOLYLINE[layer=="BOUNDARY"]')):
-        try:
-            msp.delete_entity(e)
-        except Exception:  # noqa: BLE001
-            pass
-    coords = [(float(x), float(y)) for x, y in list(poly.exterior.coords)]
-    msp.add_lwpolyline(coords, dxfattribs={"layer": "BOUNDARY", "closed": True})
-
-
 def club_dxf(
     placed_specs: list[tuple[str, str]],
     staged_specs: list[tuple[str, str]],
     output_path,
     crs: str = DEFAULT_CRS,
     review_specs: list[tuple[str, str]] | None = None,
-    boundary_override: dict | None = None,
 ) -> Path:
     """Club FMBs into one DXF (no surveyor base).
 
@@ -152,8 +135,6 @@ def club_dxf(
         except Exception as exc:  # noqa: BLE001
             _log.warning("club: skipping unreadable placed DXF %s: %s", gp, exc)
             continue
-        if boundary_override and sn in boundary_override:
-            _override_boundary(src, boundary_override[sn])
         _import_as_block(base, src, f"FMB_{sn}")
         n_placed += 1
 

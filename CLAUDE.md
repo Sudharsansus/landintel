@@ -3,6 +3,17 @@
 Production system that converts Tamil Nadu government FMB (Field Measurement Book)
 land survey PDFs into georeferenced DWG village maps, fully automated.
 
+## NON-NEGOTIABLE CLIENT RULES (read first, every time)
+1. **DON'T OVERFIT THE CODE.** Solutions must be GENERAL — use conditions / functions /
+   thresholds keyed on data, never per-village or per-file constants. (Repeated many times by
+   the client; the single most important rule.)
+2. **NEVER change the FMB scale, edge lengths, or properties while matching stones and clubbing.**
+   Placement is RIGID only (rotation + translation, scale locked to 1). Neighbours are aligned by
+   their shared STONES, never warped onto the cadastre. (A cadastre-boundary override was tried
+   and REJECTED for rewriting the FMB boundary — do not reintroduce it.)
+3. **M1 QUALITY FIRST, no compromise.** A clean, correct M1 extraction is the foundation; M2 can
+   only be as good as M1. Fix M1 quality before tuning M2.
+
 ## Pipeline (4 modules, run in sequence by orchestrator.py)
 - M1 extract:   FMB PDF -> structured DXF  (PyMuPDF vectors + PaddleOCR PP-OCRv5 + ezdxf)
 - M2 georef:    DXF -> georeferenced DWG    (affine transform + pyproj + ODA File Converter)

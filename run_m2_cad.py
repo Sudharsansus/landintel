@@ -367,13 +367,12 @@ def main() -> None:
     review_specs = [(r.output_file, r.survey_number) for r in results
                     if r.recommendation == "REVIEW"
                     and r.output_file and Path(r.output_file).exists()]
-    # Clubbed map uses the EXACT cadastre parcel edge for each ACCEPT plot's boundary -> the
-    # neighbours share one TNGIS line (perfect tiling, no gap/double). Interior FMB detail kept.
-    bnd_override = {r.survey_number: parcels.get(r.survey_number) for r in results
-                    if r.recommendation in ("ACCEPT", "ACCEPT_SEEDED")
-                    and parcels.get(r.survey_number) is not None}
-    club_dxf(placed_specs, [], out / "clubbed_village.dxf", crs=CRS, review_specs=None,
-             boundary_override=bnd_override)
+    # CLIENT RULE: the FMB scale / edge lengths / properties are NEVER changed while matching
+    # stones and clubbing. So the clubbed map keeps each plot's OWN rigid-placed FMB boundary
+    # (edge lengths preserved exactly); neighbours are aligned only by their shared STONES
+    # (snap_shared_boundaries), never warped onto the cadastre. (The cadastre-boundary override
+    # was rejected: it rewrote the FMB boundary.)
+    club_dxf(placed_specs, [], out / "clubbed_village.dxf", crs=CRS, review_specs=None)
     rev_path = out / "clubbed_review.dxf"
     if review_specs:
         club_dxf(review_specs, [], rev_path, crs=CRS)
