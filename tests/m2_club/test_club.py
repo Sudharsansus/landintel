@@ -62,6 +62,29 @@ def test_cadastral_seat_off_seat_label_demotes(tmp_path):
     assert not cand.passes_gate and "off-seat" in cand.note
 
 
+# A triangle -> only 3 corner stones. Correct shape+size+seat, but under-constrained.
+_TRI = [("A", 0.0, 0.0), ("B", 50.0, 0.0), ("C", 25.0, 40.0)]
+
+
+def test_cadastral_seat_three_stones_below_min_gate(tmp_path):
+    """>=4-stone accuracy rule: a rigid pose constrained by only 3 corner stones is
+    under-determined -> located but REVIEW, never ACCEPT, even on the CORRECT parcel."""
+    dxf = build_fmb(tmp_path / "m1_100.dxf", "100", _TRI)
+    m1 = extract_m1_dxf(dxf)
+    cand = cadastral_seat(m1, MockCadastral({"100": utm_polygon(_TRI)}))
+    assert cand is not None                 # still placed (located)
+    assert not cand.passes_gate             # but 3 stones < 4 -> below gate (REVIEW)
+
+
+def test_cadastral_seat_four_stones_passes_gate(tmp_path):
+    """The same correct placement with 4 corner stones DOES pass -- the rule only removes
+    the under-constrained (<4) fits, not well-constrained ones."""
+    dxf = build_fmb(tmp_path / "m1_100.dxf", "100", RECT)
+    m1 = extract_m1_dxf(dxf)
+    cand = cadastral_seat(m1, MockCadastral({"100": utm_polygon(RECT)}))
+    assert cand is not None and cand.passes_gate
+
+
 # --------------------------------------------------------------------------
 # Method 2: GPS / control-point seat (>=3-point LSQ similarity + seed quality).
 # --------------------------------------------------------------------------

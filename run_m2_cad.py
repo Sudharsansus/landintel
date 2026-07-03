@@ -318,6 +318,20 @@ def main() -> None:
                 n_iou_up += 1
             elif before == "ACCEPT":
                 n_contra += 1
+    # UNIVERSAL >=4-STONE ACCURACY GATE (client directive): whatever path proposed an ACCEPT
+    # (rigid seat, IoU overlay, or same-parcel containment), the placement must be constrained by
+    # >= CAD_MIN_STONES corner-stone correspondences. A 3-stone rigid fit is under-determined and
+    # tilts (the visible gap), so fewer -> REVIEW (located, not trusted). Applied after every
+    # promotion so no path can bypass it; demote-only -> 0-FP preserved.
+    from landintel.pipeline.m2_club.cadastral_seat import CAD_MIN_STONES
+    n_fewstone = 0
+    for r in results:
+        if r.recommendation == "ACCEPT" and r.placement is not None \
+                and len(r.placement.corner_ring) < CAD_MIN_STONES:
+            r.recommendation = "REVIEW"
+            r.note = (r.note + " | " if r.note else "") \
+                + f"under-constrained: {len(r.placement.corner_ring)}<{CAD_MIN_STONES} corner stones"
+            n_fewstone += 1
     print(f"\n[ParcelAgent] {len(pa.data.get('parcels',{}))} parcels; {pa.issues}")
     print(f"[TngisOverlayAgent] clubbed FMB overlays TNGIS: mean IoU={ov['mean_iou']:.2f}, "
           f"plot-overlap={ov['overlap_frac']*100:.0f}%")
@@ -325,6 +339,8 @@ def main() -> None:
     print(f"[IoU-gate] upgraded {n_iou_up} plot(s) to ACCEPT on TNGIS overlay "
           f"(strong>={IOU_STRONG} uncontested, or seated>={IOU_ACCEPT}); "
           f"demoted {n_contra} self-contradicting ACCEPT(s) (IoU<{IOU_CONTRADICT}) to REVIEW")
+    print(f"[>={CAD_MIN_STONES}-stone gate] demoted {n_fewstone} under-constrained ACCEPT(s) "
+          f"(<{CAD_MIN_STONES} corner stones) to REVIEW")
 
     counts = Counter(r.recommendation for r in results)
     placed = [r for r in results if r.placed]

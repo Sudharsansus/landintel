@@ -83,6 +83,13 @@ CAD_ROT_K = 0.30            # rot-residual tolerance per metre of placed equival
 # label-point jitter. It only ADDS a rejection; it never promotes. (Resolution/zone-agnostic.)
 SEAT_K = 1.6
 SEAT_FLOOR_M = 60.0
+# MINIMUM CORNER-STONE MATCH for a confident cadastral ACCEPT. A rigid pose (rotation +
+# translation, scale~1) is only well-CONSTRAINED by >= 4 corner correspondences; a 3-stone fit
+# is minimal and a single jittered stone tilts the whole placement (the visible "gap"). So a plot
+# fit with fewer than this is still PLACED (located) but routed to REVIEW, never ACCEPT. All
+# current village plots already carry >= 4 corners, so this tightens the standard without loss.
+# Override via env (LANDINTEL_CAD_MIN_STONES); default 4.
+CAD_MIN_STONES = int(os.environ.get("LANDINTEL_CAD_MIN_STONES", "4"))
 
 
 def _placed_area(fit, m1) -> float:
@@ -120,6 +127,10 @@ def _rigidify(fit, m1):
 
 def _passes_shape_gate(fit, m1) -> bool:
     if fit is None or fit.method != "rigid":
+        return False
+    # Require the rigid fit to be constrained by >= CAD_MIN_STONES corner stones. Fewer than
+    # that is an under-determined pose -> located but REVIEW, never a confident ACCEPT.
+    if len(m1.outer_stone_indices) < CAD_MIN_STONES:
         return False
     if not (CAD_AREA_LO <= fit.area_ratio <= CAD_AREA_HI
             and CAD_SCALE_LO <= fit.s <= CAD_SCALE_HI
