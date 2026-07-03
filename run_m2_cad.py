@@ -156,11 +156,23 @@ def main() -> None:
     # (NOT a fixed bbox): a coarse web/pincode/Nominatim centroid pins WHERE to look; the
     # survey-number density-peak + FMB-shape IoU still refine WHICH block is really ours.
     anchor_ll = None
+    if opt["cx"] is None:
+        # No manual anchor -> the CoordinateFinderAgent finds it automatically (rough web geocode
+        # refined to the EXACT TNGIS village centroid by survey number). Keeps --lat/--lon optional.
+        from landintel.agents.coordinate_finder import CoordinateFinderAgent
+        cf = CoordinateFinderAgent().find(
+            village, surveys, district=opt["district"] or _taluk_district(m1_paths, village)[1],
+            taluk=opt["taluk"] or _taluk_district(m1_paths, village)[0], crs=CRS)
+        if cf.get("lat") is not None:
+            opt["cx"], opt["cy"] = Transformer.from_crs("EPSG:4326", CRS, always_xy=True).transform(
+                cf["lon"], cf["lat"])
+            print(f"[2/4] CoordinateFinderAgent: {village} @ ({cf['lat']},{cf['lon']}) "
+                  f"[{cf['confidence']}, {cf['method']}]")
     if opt["cx"] is not None:
         _lon, _lat = Transformer.from_crs(CRS, "EPSG:4326", always_xy=True).transform(
             opt["cx"], opt["cy"])
         anchor_ll = (_lat, _lon)
-        print(f"[2/4] web anchor UTM43 ({opt['cx']:.0f},{opt['cy']:.0f})"
+        print(f"[2/4] anchor UTM43 ({opt['cx']:.0f},{opt['cy']:.0f})"
               f"{' -> VECTOR cadastre' if opt['vector'] else ' -> density-peak + IoU refine'}")
     else:
         print(f"[2/4] auto-locating {village} by geocode + Qwen + survey-number fingerprint...")
