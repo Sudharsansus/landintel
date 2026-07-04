@@ -46,3 +46,7 @@ reference/Sreeragu-FMBtoDXF-sreeragu-dev/
 input/*/s3_*/
 output/
 data/tngis/
+
+# local scratch: investigation probes / experiments (never commit)
+scratchpad/
+m2_m3_lifts/

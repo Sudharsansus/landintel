@@ -50,6 +50,18 @@ M3_REVIEW_RESIDUAL_MEDIAN_M: float = 3.5
 # rigid match onto UTM surveyor stones has s ~ 1. Outside this = an M1 unit bug upstream.
 M3_SCALE_LO: float = 0.5
 M3_SCALE_HI: float = 2.0
+# Cadastre corroboration tolerance. The cadastre seat is a LOCATION PRIOR M3 computes itself by
+# running the shared M2 club algorithm on an independently-built TNGIS source (NOT M2's output
+# files). Used two ways, both 0-FP: (a) to CROP the surveyor-stone search to the plot's
+# neighbourhood (run_m3), and (b) here as an INDEPENDENT cross-check -- a survey-grade stone
+# placement within this many metres of the seat is confirmed by TWO independent sources (field
+# stones + government cadastre), one that DISAGREES with an available seat is demoted
+# ACCEPT->REVIEW. VALUE FROM MEASUREMENT (not a guess): the four true survey-grade placements
+# land 10-44 m from the independently-reproduced seat (the seat itself carries the cadastre's
+# own ~10-40 m reproduction offset), while chance-congruent decoys relocate ~700 m -- so 60 m
+# sits in a ~12x gap, NOT knife-edge / not overfit. The cadastre NEVER sets a coordinate
+# (rule 2, crop-only): a wrong seat can only withhold trust, never grant it.
+M3_CORROB_TOL_M: float = 60.0
 
 _CONFIDENT = ("ACCEPT",)
 
@@ -67,6 +79,7 @@ class M3Placement:
     n_corners: int = 0
     median_residual_m: float = float("nan")
     max_residual_m: float = float("nan")
+    cadastre_corrob_m: float = float("nan")   # dist placement<->cadastre seat (NaN = no seat)
     note: str = ""
     m1_file: str = ""
 
@@ -98,7 +111,8 @@ def place_scale_locked(src_corners: np.ndarray, dst_stones: np.ndarray):
 
 
 def classify(n_matched: int, n_corners: int, median_resid: float, max_resid: float,
-             s_fitted: float, tiles: bool, window_has_stones: bool) -> tuple[str, str]:
+             s_fitted: float, tiles: bool, window_has_stones: bool,
+             cadastre_corrob_m: float | None = None) -> tuple[str, str]:
     """First-class M3 disposition cascade (best evidence first). No silent demotions.
 
     UNMEASURED   -- the surveyor set no stones in this plot's search window (data gap).
@@ -106,6 +120,13 @@ def classify(n_matched: int, n_corners: int, median_resid: float, max_resid: flo
                     survey-grade, max within the sanity ceiling, tiles, scale sane.
     REVIEW       -- located but weaker (>= min(CAD_MIN_STONES, n) matched, looser residual).
     NEEDS_GPS    -- stones are present but no fit clears REVIEW (needs a GPS/operator seed).
+
+    ``cadastre_corrob_m`` (optional) is the distance between the stone placement and the
+    INDEPENDENT cadastre seat (survey# -> parcel centroid). When present it is an extra 0-FP
+    cross-check applied to an ACCEPT only: within ``M3_CORROB_TOL_M`` -> confirmed by two
+    independent sources (kept ACCEPT, noted); beyond it -> the survey-grade fit disagrees with
+    where the cadastre says this survey number is, so demote ACCEPT->REVIEW. It can only
+    withhold an ACCEPT, never create one (the cadastre never sets a coordinate; rule 2).
     """
     if not window_has_stones:
         return "UNMEASURED", "no surveyor stones in the plot's search window (data gap)"
@@ -118,8 +139,15 @@ def classify(n_matched: int, n_corners: int, median_resid: float, max_resid: flo
             and median_resid <= M3_ACCEPT_RESIDUAL_MEDIAN_M
             and max_resid <= M3_ACCEPT_RESIDUAL_MAX_M
             and scale_ok and tiles):
-        return "ACCEPT", (f"n={n_matched}/{n_corners} med={median_resid:.2f}m "
-                          f"max={max_resid:.2f}m s_fit={s_fitted:.3f} (survey-grade)")
+        reason = (f"n={n_matched}/{n_corners} med={median_resid:.2f}m "
+                  f"max={max_resid:.2f}m s_fit={s_fitted:.3f} (survey-grade)")
+        if cadastre_corrob_m is not None and cadastre_corrob_m == cadastre_corrob_m:
+            if cadastre_corrob_m <= M3_CORROB_TOL_M:
+                return "ACCEPT", (reason + f" + cadastre-corroborated {cadastre_corrob_m:.1f}m "
+                                  f"(2 independent sources agree)")
+            return "REVIEW", (reason + f" BUT disagrees with the cadastre seat by "
+                              f"{cadastre_corrob_m:.0f}m (>{M3_CORROB_TOL_M:.0f}m) -> confirm")
+        return "ACCEPT", reason
 
     if n_matched >= review_bar and median_resid <= M3_REVIEW_RESIDUAL_MEDIAN_M:
         reason = "located; confirm placement" if scale_ok else "located; scale off -> confirm"
@@ -220,6 +248,8 @@ def write_report(placements: list[M3Placement], out_path: Path, *,
                                else round(p.max_residual_m, 3)),
             "s_fitted": (None if p.s_fitted != p.s_fitted else round(p.s_fitted, 4)),
             "scale_locked_to": 1.0,
+            "cadastre_corrob_m": (None if p.cadastre_corrob_m != p.cadastre_corrob_m
+                                  else round(p.cadastre_corrob_m, 2)),
             "note": p.note,
         })
     rows.sort(key=lambda r: (r["disposition"] != "ACCEPT",
