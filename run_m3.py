@@ -480,10 +480,16 @@ def main() -> None:
             all_stones.append(spos)
     stones = np.vstack(all_stones) if all_stones else np.empty((0, 2))
 
-    # SINGLE M3 OUTPUT: every village's plots clubbed onto the shared surveyor stones in ONE DXF.
-    single = len(villages) == 1
-    outdir = Path(f"output/{villages[0]}/m3") if single else Path("output/M3_CLUBBED")
-    title = villages[0] if single else "+".join(villages)
+    # SINGLE M3 OUTPUT -- ALWAYS one clubbed DXF (never per-village files), even for one village:
+    # the surveyor stone cloud is one district-wide cloud, so M3 clubs every plot onto it in ONE
+    # output/M3_CLUBBED/clubbed_village.dxf. Any stale per-village output/<v>/m3 dirs are removed.
+    import shutil
+    for v in villages:
+        old = Path(f"output/{v}/m3")
+        if old.exists():
+            shutil.rmtree(old, ignore_errors=True)
+    outdir = Path("output/M3_CLUBBED")
+    title = "+".join(villages)
     write_dxf(all_pl, outdir / "clubbed_village.dxf", crs=CRS)
     write_overlay(all_pl, stones, outdir / "qa_overlay.png", village=title)
     write_report(all_pl, outdir / "m3_report.json", village=title)
