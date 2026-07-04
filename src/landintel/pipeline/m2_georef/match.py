@@ -433,6 +433,7 @@ def geometric_match(
     allowed_stones: "np.ndarray | None" = None,
     expected_xy: "tuple[float, float] | np.ndarray | None" = None,
     max_seat_dist: float = _GEOM_MAX_SEAT_DIST,
+    candidate_sink=None,
 ) -> MatchResult:
     """Find the M1 corner polygon inside the surveyor stone cloud by congruence.
 
@@ -536,11 +537,18 @@ def geometric_match(
                         continue
                     mean_res = float(dist[inmask].mean())
                     key = (ninl, -mean_res)
-                    if best is None or key > (best[0], -best[1]):
+                    make_smap = (candidate_sink is not None
+                                 or best is None or key > (best[0], -best[1]))
+                    if make_smap:
                         smap = [-1] * m1.n_stones
                         for k, cidx in enumerate(corners):
                             if inmask[k]:
                                 smap[cidx] = int(idx[k])
+                    if candidate_sink is not None:
+                        # Coverage-aware selection hook: offer EVERY viable pose (not just the
+                        # max-inlier one) to the caller. Default None -> INGUR path byte-identical.
+                        candidate_sink(ninl, mean_res, list(smap), R, s, t)
+                    if best is None or key > (best[0], -best[1]):
                         best = (ninl, mean_res, smap, R, s, t)
 
     if best is None:

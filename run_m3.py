@@ -46,7 +46,7 @@ from shapely.geometry import Polygon
 
 from landintel.pipeline.m2_georef.extract_m1 import extract_m1_dxf
 from landintel.pipeline.m2_georef.extract_surveyor import extract_surveyor
-from landintel.pipeline.m2_georef.match import geometric_match
+from landintel.pipeline.m2_georef.match import MatchResult, geometric_match
 from landintel.pipeline.m2_georef.verify import build_traced_buffer, chain_coverage
 from landintel.pipeline.m2_georef.m3_deliverables import (
     M3Placement, M3_CORROB_TOL_M, M3_ACCEPT_RESIDUAL_MEDIAN_M, M3_ACCEPT_RESIDUAL_MAX_M,
@@ -197,7 +197,7 @@ def _overlaps(fp, placed):
     return False
 
 
-def place_village(village, surveyor, district="Erode", taluk=""):
+def place_village(village, surveyor, district="Erode", taluk="", edge_recover=False):
     """Place ALL of ONE village's M1 FMBs onto the surveyor stone cloud by sequential verified
     growth (the client's 'match ONE FMB, verify, commit, then move to the next'). Returns
     ``(list[M3Placement], surveyor stone positions in the village window)``. A reusable METHOD:
@@ -306,20 +306,17 @@ def place_village(village, surveyor, district="Erode", taluk=""):
 
     direct = {sv: _direct_place(sv, m1) for sv, m1 in m1s.items()}
 
-    def _verified(sv, pl):
-        """Commit a placement only when an independent GROUND-TRUTH source confirms it. Two paths,
-        both 0-FP; the accuracy bar (robust MEDIAN residual) is never relaxed:
+    def _accept_gate(n, pl):
+        """The M3 survey-grade ACCEPT gate -- commit only when an independent GROUND-TRUTH source
+        confirms it. Two 0-FP paths; the accuracy bar (robust MEDIAN residual) is never relaxed:
           A. SURVEY-BOUNDARY CONFIRMED (the INGUR gate): the FMB boundary lies on the surveyor's
              actually-traced SITE DATA LINE (chain_coverage >= M3_CHAIN_COVERAGE_ACCEPT) on a
-             well-constrained pose (>= min(6,n)) with a real match (median < 3 m). This is DIRECT
-             ground truth -- the surveyor traced this exact boundary here -- so no cadastre proxy
-             is needed, and a single FMB-noisy corner does not disqualify a boundary that follows
-             the surveyed line.
+             well-constrained pose (>= min(6,n)) with a real match (median < 3 m) -- direct ground
+             truth, so one FMB-noisy corner does not disqualify a boundary that follows the line.
           B. CADASTRE-CONFIRMED (fallback when the surveyor did NOT trace this boundary): survey-
              grade at EVERY corner (median<=2 AND max<=3) on a dense pose (>= min(5,n)) AND agrees
              with the plot's own government cadastre seat (<= M3_CORROB_TOL_M).
         Tiling vs the committed set is checked by the caller. Returns (ok, score)."""
-        n = len(m1s[sv].outer_stone_indices)
         res = pl.get("residuals", [])
         if len(res) == 0:
             return False, 0.0
@@ -335,6 +332,64 @@ def place_village(village, surveyor, district="Erode", taluk=""):
             return False, 0.0
         score = pl["n_matched"] - med + (2.0 * cov if cov == cov else 0.0)
         return True, score
+
+    def _verified(sv, pl):
+        """Thin wrapper over ``_accept_gate`` keyed on the plot's own corner count."""
+        return _accept_gate(len(m1s[sv].outer_stone_indices), pl)
+
+    def _seed_crop_mask(m1, seat):
+        """Boolean mask of surveyor stones inside the plot's cadastre-seeded local window
+        (its own radius + SEED_CROP_MARGIN), or None if fewer than 4 stones fall in it."""
+        ring0 = m1.stone_positions()[np.array(m1.outer_stone_indices)]
+        prad = float(np.hypot(np.ptp(ring0[:, 0]), np.ptp(ring0[:, 1]))) * 0.6
+        d = np.hypot(spos[:, 0] - seat[0], spos[:, 1] - seat[1])
+        allowed = d <= (prad + SEED_CROP_MARGIN)
+        return allowed if allowed.sum() >= 4 else None
+
+    def _best_gated_pose(sv, m1):
+        """COVERAGE-AWARE POSE RESCUE (general, 0-FP). geometric_match returns only its single
+        MAX-INLIER pose and NEVER sees chain coverage, so it can hand back an on-seat pose that JUST
+        misses the gate (one extra inlier at a looser residual) while a slightly-fewer-inlier pose
+        on the SAME local stones lies squarely on the surveyor's traced boundary and CLEARS the gate.
+        This re-examines the WHOLE RANSAC candidate set (via candidate_sink) and returns the best
+        pose the UNCHANGED ``_accept_gate`` already blesses, or None. It lowers NO gate and only
+        chooses among poses the search itself produced -> cannot create a false positive; and it is
+        locality-safe (with a seat it searches only the seeded local crop, so a far chance decoy is
+        never a candidate). GENERAL -- the same data-keyed bars decide, no per-village value."""
+        seat = seeds.get(sv)
+        n = len(m1.outer_stone_indices)
+        mask = None
+        if seat is not None:
+            mask = _seed_crop_mask(m1, seat)
+            if mask is None:                               # too few local stones -> no evidence
+                return None
+        poses = []
+        geometric_match(m1, sd, allowed_stones=mask,
+                        candidate_sink=lambda ninl, mr, smap, R, s, t: poses.append(smap))
+        best = None                                        # (score, placement)
+        for smap in poses:
+            p = _place(m1, sd, MatchResult(stone_map=smap, fingerprint_score=0.0,
+                       neighborhood_score=0.0, combined_score=0.0, matched=True))
+            if p is None:
+                continue
+            res = p["residuals"]
+            med = float(np.median(res)); mx = float(np.max(res))
+            if seat is not None:
+                pc = p["ring"].mean(axis=0)
+                p["corrob"] = float(np.hypot(pc[0] - seat[0], pc[1] - seat[1]))
+            # Prune cheaply: only a pose that could clear cad_ok (residual+seat) or chain_ok
+            # (inliers+residual) is worth the chain-coverage cost.
+            could_cad = (p["n_matched"] >= min(FULL_MATCH_STONES, n)
+                         and med <= M3_ACCEPT_RESIDUAL_MEDIAN_M and mx <= M3_ACCEPT_RESIDUAL_MAX_M
+                         and p.get("corrob") is not None and p["corrob"] <= M3_CORROB_TOL_M)
+            could_chain = (p["n_matched"] >= min(6, n) and med < M3_ACCEPT_RESIDUAL_MAX_M)
+            if not (could_cad or could_chain):
+                continue
+            p["chain_cov"] = _chaincov(p["ring"]) if could_chain else float("nan")
+            ok, score = _accept_gate(n, p)
+            if ok and (best is None or score > best[0]):
+                best = (score, p)
+        return best[1] if best is not None else None
 
     # --- SEQUENTIAL VERIFIED GROWTH (client's method: match ONE FMB, VERIFY, commit, next) ---
     # No batch "place all then judge". Each round commits exactly ONE more plot -- the single
@@ -411,6 +466,103 @@ def place_village(village, surveyor, district="Erode", taluk=""):
     if n_rel:
         print(f"[3b/4] relative stone-match: +{n_rel} plot(s) seated one-by-one by shared FMB "
               f"corners with a confirmed neighbour (client FMBS_STONES_MATCH, cadastre-verified)")
+
+    # --- COVERAGE-AWARE RESCUE (finishing pass; one verified commit per round) ----------------
+    # geometric_match trusts only its SINGLE max-inlier pose, which never sees chain coverage; it
+    # can leave a plot unplaced whose boundary actually lies on the traced SITE DATA LINE under a
+    # slightly-fewer-inlier pose. For each STILL-unplaced plot, re-search the RANSAC candidate set
+    # (_best_gated_pose) for a pose the UNCHANGED accept gate blesses and commit it if it tiles.
+    # Touches ONLY leftover plots (nothing already clubbed changes); 0-FP (no gate lowered) and
+    # locality-safe (seat plots search only their local crop, so a far decoy is never a candidate).
+    n_resc = 0
+    blocked: dict[str, dict] = {}      # gate-passing poses rejected ONLY by tiling -> honest REVIEW
+    while True:
+        best = None                                        # (sv, pl, fp, score)
+        for sv, m1 in m1s.items():
+            if sv in placed:
+                continue
+            pl = _best_gated_pose(sv, m1)
+            if pl is None:
+                continue
+            fp = _fp(pl["ring"])
+            if fp is None:
+                continue
+            if _overlaps(fp, placed_fp):
+                # gate-passing but overlaps a higher-evidence committed neighbour: real parcels
+                # tile, so it cannot be clubbed here -> remember it for an HONEST REVIEW, never ACCEPT.
+                prev = blocked.get(sv)
+                if prev is None or pl["n_matched"] > prev["n_matched"]:
+                    blocked[sv] = pl
+                continue
+            ok, score = _verified(sv, pl)
+            if ok and (best is None or score > best[3]):
+                best = (sv, pl, fp, score)
+        if best is None:
+            break
+        sv, pl, fp, _s = best
+        placed[sv], placed_fp[sv] = pl, fp                 # commit ONE rescued survey-grade plot
+        direct[sv] = pl                                    # keep direct[] consistent for the report
+        n_resc += 1
+    if n_resc:
+        print(f"[3c/4] coverage-aware rescue: +{n_resc} plot(s) recovered by a traced-line / "
+              f"cadastre-confirmed pose the max-inlier matcher overlooked (survey-grade, 0-FP)")
+    # A located plot that clears the gate but lost the shared land to a placed neighbour is a REVIEW
+    # (confirm extent), not a NEEDS_GPS -- record its located pose so the disposition draws it.
+    for sv, pl in blocked.items():
+        if sv not in placed and pl.get("corrob") is not None and pl["corrob"] <= M3_CORROB_TOL_M:
+            direct[sv] = pl
+
+    # --- Phase (opt-in): edge-register recovery, ER-DUAL gate ---------------------------------
+    # Last lever for a plot the surveyor TRACED (SITE DATA LINE) but which exposed too few CORNER
+    # stones for RANSAC. edge_register maximizes chain coverage over M1-edge->traced-segment fits.
+    # But coverage-MAX overfits the dense traced field: a chance pose can hit >=0.50 far from the
+    # plot's true seat (measured: 14/19 KANDAMPALAYAM poses >=0.50 land 160-1300 m off-seat). So it
+    # is trusted ONLY under the CONJUNCTION of BOTH independent signals: chain coverage >=
+    # M3_CHAIN_COVERAGE_ACCEPT AND the same pose lands within M3_CORROB_TOL_M of the plot's own
+    # cadastre seat. Stricter than either alone -> 0-FP (recovers exactly KAND 54 @ 8 m, the one
+    # honest plot). Rigid (scale=1, rule 2). OFF by default (edge_register is ~1 min/plot); enable
+    # with --edge-recover for the extra pass. General: no per-village constant, validated thresholds.
+    if traced_buf is not None and edge_recover:
+        from landintel.pipeline.m2_georef.edge_register import (
+            register_plot_on_traced, traced_segments)
+        n_er = 0
+        for sv, m1 in m1s.items():
+            if sv in placed:
+                continue
+            seat = seeds.get(sv)
+            if seat is None:                               # need the 2nd source to corroborate
+                continue
+            keep = np.hypot(spos[:, 0] - seat[0], spos[:, 1] - seat[1]) <= 300.0
+            if keep.sum() < 4:
+                continue
+            segs = traced_segments(sd, keep=keep)          # cropped to the seat window (tractable)
+            if not segs:
+                continue
+            er = register_plot_on_traced(m1, sd, segments=segs)
+            if er is None or er.coverage < M3_CHAIN_COVERAGE_ACCEPT or len(er.matched_pairs) < 3:
+                continue
+            pos = m1.stone_positions()                     # rigid (scale=1) refit on the anchors
+            src = np.array([pos[a] for a, b in er.matched_pairs], float)
+            dst = np.array([spos[b] for a, b in er.matched_pairs], float)
+            R, t, s_fit, resid = place_scale_locked(src, dst)
+            if not (0.5 < s_fit < 2.0):
+                continue
+            ring = (pos @ R.T + t)[np.array(m1.outer_stone_indices)]
+            cov = _chaincov(ring)
+            pc = ring.mean(axis=0)
+            corrob = float(np.hypot(pc[0] - seat[0], pc[1] - seat[1]))
+            if not (cov == cov and cov >= M3_CHAIN_COVERAGE_ACCEPT and corrob <= M3_CORROB_TOL_M):
+                continue                                   # ER-DUAL conjunction (0-FP)
+            fp = _fp(ring)
+            if fp is None or _overlaps(fp, placed_fp):
+                continue
+            placed[sv] = {"R": R, "t": t, "s_fitted": s_fit, "ring": ring, "residuals": resid,
+                          "n_matched": len(src), "chain_cov": cov, "corrob": corrob}
+            placed_fp[sv] = fp
+            n_er += 1
+        if n_er:
+            print(f"[3d/4] edge-register recovery: +{n_er} plot(s) placed by boundary-on-traced-"
+                  f"line AND cadastre agreement (ER-dual conjunction, 0-FP)")
 
     # --- Honest first-class dispositions + the three deliverables (rule 2: scale-locked) ---
     placements = []
@@ -512,13 +664,14 @@ def main() -> None:
     surveyor = a[a.index("--surveyor") + 1] if "--surveyor" in a else None
     district = a[a.index("--district") + 1] if "--district" in a else "Erode"
     taluk = a[a.index("--taluk") + 1] if "--taluk" in a else ""
+    edge_recover = "--edge-recover" in a               # opt-in slow coverage-driven ER-dual pass
     if not surveyor or not villages:
         raise SystemExit("usage: python run_m3.py <VILLAGE> [VILLAGE ...] "
-                         "--surveyor <RAW DATA.dxf> [--district Erode]")
+                         "--surveyor <RAW DATA.dxf> [--district Erode] [--edge-recover]")
 
     all_pl, all_stones = [], []
     for v in villages:
-        placements, spos = place_village(v, surveyor, district, taluk)
+        placements, spos = place_village(v, surveyor, district, taluk, edge_recover=edge_recover)
         all_pl += placements
         if spos is not None and len(spos):
             all_stones.append(spos)
