@@ -230,9 +230,17 @@ def place_village(village, surveyor, district="Erode", taluk=""):
     else:
         pad = 1500.0
         bbox = (ax - pad, ay - pad, ax + pad, ay + pad)
-    sd = extract_surveyor(surveyor, bbox=bbox); sd.build_index()
+    # StoneReaderAgent: read + VERIFY the surveyor stone points and their EXACT UTM coords, then
+    # match FMB corners against those verified points. (Reads only; never places/accepts -> 0-FP.)
+    from landintel.agents.stone_reader import StoneReaderAgent
+    sd, sr = StoneReaderAgent().read(surveyor, bbox=bbox, crs=CRS)
     spos = sd.stone_positions
-    print(f"[2/4] {len(sd.stones)} surveyor stones in the {village} window "
+    sr_fail = [c for c in sr.checks if c.severity.value == "fail"]
+    sr_warn = [c for c in sr.checks if c.severity.value == "warn"]
+    status = "verified" if not (sr_fail or sr_warn) else (
+        "FAIL:" + sr_fail[0].detail if sr_fail else "WARN:" + sr_warn[0].detail)
+    print(f"[2/4] StoneReaderAgent: {len(sd.stones)} surveyor stone points read+{status} "
+          f"in the {village} window "
           f"({'seed-pinned on the cadastre block' if seeds else 'anchor-pinned'})")
 
     from landintel.pipeline.m2_club.placement import CandidatePlacement
@@ -492,6 +500,20 @@ def main() -> None:
     outdir = Path("output/M3_CLUBBED")
     outdir.mkdir(parents=True, exist_ok=True)
     title = "+".join(villages)
+
+    # StoneReaderAgent: publish the FULL verified catalog of EXACT surveyor stone points (UTM
+    # coords + codes) the matcher aligns FMB corners to -> stone_points.csv + stone_read_report.json.
+    try:
+        from landintel.agents.base import write_json
+        from landintel.agents.stone_reader import StoneReaderAgent
+        _reader = StoneReaderAgent()
+        sd_all, sr_all = _reader.read(surveyor, bbox=None, crs=CRS)
+        _reader.write_catalog(sd_all, outdir / "stone_points.csv")
+        write_json(outdir / "stone_read_report.json", sr_all.to_dict())
+        print(f"[stones] {len(sd_all.stones)} exact surveyor stone points cataloged "
+              f"(read {'OK' if not sr_all.failed else 'FAILED'}) -> stone_points.csv")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[stones] catalog skipped ({exc})")
 
     # OPERATOR LOOP-CLOSER: turn the InputRequest worklist ANSWERS into closed plots (the last
     # mile of "100% is a process"). If the operator has dropped operator_confirms.json /
