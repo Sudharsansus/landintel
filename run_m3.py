@@ -537,6 +537,20 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001
         print(f"[operator] loop-closer skipped ({exc})")
 
+    # UmeyamaVerifierAgent: verify the MATH of every placement (orthonormal R, det=+1 = no
+    # reflection/mirror-flip, diagnostic scale in band, valid SIMPLE ring). Demote-only on unsound
+    # math (never promote) -> 0-FP. Runs before the agent layer so a demote reflects into the DXF.
+    try:
+        from landintel.agents.base import write_json as _wj
+        from landintel.agents.umeyama_verifier import UmeyamaVerifierAgent
+        uv = UmeyamaVerifierAgent().verify(all_pl)
+        _wj(outdir / "umeyama_verify_report.json", uv.to_dict())
+        _uvf = [c for c in uv.checks if c.severity.value == "fail"]
+        print(f"[umeyama] transform+ring verify: "
+              f"{'OK (all placements mathematically sound)' if not _uvf else 'FAIL: ' + _uvf[0].detail}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[umeyama] verify skipped ({exc})")
+
     # WAKE THE AGENT LAYER (M3 was bypassing the orchestrator -- "sleeping agents"). Runs the
     # SAME self-verifying pipeline M2 uses: VerificationAgent (FP invariants -> shippable) +
     # GuardAgent (180-deg anagram trap) + InputRequestAgent (the path-to-100% worklist: the ONE
