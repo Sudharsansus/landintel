@@ -489,7 +489,25 @@ def main() -> None:
         if old.exists():
             shutil.rmtree(old, ignore_errors=True)
     outdir = Path("output/M3_CLUBBED")
+    outdir.mkdir(parents=True, exist_ok=True)
     title = "+".join(villages)
+
+    # WAKE THE AGENT LAYER (M3 was bypassing the orchestrator -- "sleeping agents"). Runs the
+    # SAME self-verifying pipeline M2 uses: VerificationAgent (FP invariants -> shippable) +
+    # GuardAgent (180-deg anagram trap) + InputRequestAgent (the path-to-100% worklist: the ONE
+    # minimal input that closes each unplaced plot) + LLMAssist (Qwen narration) + propose->
+    # re-gate + persistent memory + decision-trace + QGIS review layer. Agents NEVER promote to
+    # ACCEPT (0-FP by construction); they may only DEMOTE a confident plot that breaks an
+    # invariant, which reflects onto its disposition BEFORE the DXF below is written.
+    try:
+        from landintel.agents.orchestrator import run_agent_layer
+        summ = run_agent_layer(all_pl, outdir, context={
+            "village": title, "crs": CRS, "surveyor": surveyor, "stage": "m3"})
+        print(f"[agents] shippable={summ['shippable']} (0 false positives by construction) | "
+              f"{summ['n_requests']} plot(s) need input to reach 100% -> input_requests.json")
+    except Exception as exc:  # noqa: BLE001 - the agent layer must never break the deliverable
+        print(f"[agents] agent layer skipped ({exc})")
+
     write_dxf(all_pl, outdir / "clubbed_village.dxf", crs=CRS)
     write_overlay(all_pl, stones, outdir / "qa_overlay.png", village=title)
     write_report(all_pl, outdir / "m3_report.json", village=title)

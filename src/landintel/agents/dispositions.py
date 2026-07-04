@@ -212,6 +212,48 @@ def _georef_footprint(output_file: str):
     return None
 
 
+# M3 single-clubbed-output states -> the stage-agnostic valid states. ACCEPT_RELATIVE (the
+# client's shared-stone tie, cadastre-verified) is a CONFIDENT placement, mapped to
+# ACCEPT_SEEDED (identity supplied by a confirmed neighbour, like a seed). NEEDS_GPS/UNMEASURED
+# -> NO_COVERAGE so the InputRequest agent emits the "2 corner GPS points" ask for each.
+_M3_STATE = {"ACCEPT": "ACCEPT", "ACCEPT_RELATIVE": "ACCEPT_SEEDED", "REVIEW": "REVIEW",
+             "NEEDS_GPS": "NO_COVERAGE", "UNMEASURED": "NO_COVERAGE"}
+
+
+def from_m3_placement(p) -> PlotDisposition:
+    """Normalize an M3 ``M3Placement`` (single clubbed stone-cloud output). Footprint comes from
+    the in-memory placed ring; survey id is ``village:survey#`` so the combined multi-village
+    worklist is unambiguous. Cross-village is left off (m1_file empty): every M3 plot is already
+    placed in its own village window, and the combined run has no single ``village`` to compare to."""
+    try:
+        fp = p.footprint()
+    except Exception:  # noqa: BLE001
+        fp = None
+    rec = _M3_STATE.get(getattr(p, "disposition", "REVIEW"), "REVIEW")
+    village = getattr(p, "village", "") or ""
+    sid = f"{village}:{p.survey_number}" if village else str(p.survey_number)
+    n_matched = int(getattr(p, "n_matched", 0) or 0)
+    med = float(getattr(p, "median_residual_m", float("nan")))
+    return PlotDisposition(
+        survey=sid,
+        recommendation=rec,
+        method="geometric" if fp is not None else "",   # stone-match path (surveyor field stones)
+        footprint=fp,
+        confidence=float(n_matched),                    # denser match wins a demote tie-break
+        note=getattr(p, "note", "") or "",
+        chain_coverage=(1.0 if med == med and med <= 2.0 else float("nan")),
+        n_inliers=n_matched,
+        n_corners=int(getattr(p, "n_corners", 0) or 0),
+        source="m3",
+        raw=p,
+    )
+
+
+def _looks_like_m3(r) -> bool:
+    # M3Placement carries `.disposition` and `.ring_utm` (no `.placement`, no `.match_method`).
+    return hasattr(r, "disposition") and hasattr(r, "ring_utm")
+
+
 def _looks_like_club(r) -> bool:
     # ClubResult carries `.placement` and `.method`; GeorefResult carries `.match_method`.
     return hasattr(r, "placement") and hasattr(r, "method") and not hasattr(r, "match_method")
@@ -229,6 +271,8 @@ def normalize(results) -> list[PlotDisposition]:
     for r in results or []:
         if isinstance(r, PlotDisposition):
             out.append(r)
+        elif _looks_like_m3(r):
+            out.append(from_m3_placement(r))
         elif _looks_like_club(r):
             out.append(from_club_result(r))
         elif hasattr(r, "match_method"):

@@ -92,6 +92,17 @@ class M3Placement:
             p = p.buffer(0)
         return p if (not p.is_empty and p.area > 0) else None
 
+    # Alias so the runtime agent layer (which speaks ``recommendation``) can read AND
+    # demote-write this placement: the VerificationAgent may only turn a confident plot ->
+    # REVIEW, and that reflects straight onto ``disposition`` (never a promotion).
+    @property
+    def recommendation(self) -> str:
+        return self.disposition
+
+    @recommendation.setter
+    def recommendation(self, value: str) -> None:
+        self.disposition = value
+
 
 def place_scale_locked(src_corners: np.ndarray, dst_stones: np.ndarray):
     """Scale-locked rigid placement of matched M1 corners onto surveyor stones (rule 2).
