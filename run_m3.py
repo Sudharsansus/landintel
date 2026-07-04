@@ -197,7 +197,7 @@ def _overlaps(fp, placed):
     return False
 
 
-def place_village(village, surveyor, district="Erode", taluk="", edge_recover=False):
+def place_village(village, surveyor, district="Erode", taluk=""):
     """Place ALL of ONE village's M1 FMBs onto the surveyor stone cloud by sequential verified
     growth (the client's 'match ONE FMB, verify, commit, then move to the next'). Returns
     ``(list[M3Placement], surveyor stone positions in the village window)``. A reusable METHOD:
@@ -512,57 +512,11 @@ def place_village(village, surveyor, district="Erode", taluk="", edge_recover=Fa
         if sv not in placed and pl.get("corrob") is not None and pl["corrob"] <= M3_CORROB_TOL_M:
             direct[sv] = pl
 
-    # --- Phase (opt-in): edge-register recovery, ER-DUAL gate ---------------------------------
-    # Last lever for a plot the surveyor TRACED (SITE DATA LINE) but which exposed too few CORNER
-    # stones for RANSAC. edge_register maximizes chain coverage over M1-edge->traced-segment fits.
-    # But coverage-MAX overfits the dense traced field: a chance pose can hit >=0.50 far from the
-    # plot's true seat (measured: 14/19 KANDAMPALAYAM poses >=0.50 land 160-1300 m off-seat). So it
-    # is trusted ONLY under the CONJUNCTION of BOTH independent signals: chain coverage >=
-    # M3_CHAIN_COVERAGE_ACCEPT AND the same pose lands within M3_CORROB_TOL_M of the plot's own
-    # cadastre seat. Stricter than either alone -> 0-FP (recovers exactly KAND 54 @ 8 m, the one
-    # honest plot). Rigid (scale=1, rule 2). OFF by default (edge_register is ~1 min/plot); enable
-    # with --edge-recover for the extra pass. General: no per-village constant, validated thresholds.
-    if traced_buf is not None and edge_recover:
-        from landintel.pipeline.m2_georef.edge_register import (
-            register_plot_on_traced, traced_segments)
-        n_er = 0
-        for sv, m1 in m1s.items():
-            if sv in placed:
-                continue
-            seat = seeds.get(sv)
-            if seat is None:                               # need the 2nd source to corroborate
-                continue
-            keep = np.hypot(spos[:, 0] - seat[0], spos[:, 1] - seat[1]) <= 300.0
-            if keep.sum() < 4:
-                continue
-            segs = traced_segments(sd, keep=keep)          # cropped to the seat window (tractable)
-            if not segs:
-                continue
-            er = register_plot_on_traced(m1, sd, segments=segs)
-            if er is None or er.coverage < M3_CHAIN_COVERAGE_ACCEPT or len(er.matched_pairs) < 3:
-                continue
-            pos = m1.stone_positions()                     # rigid (scale=1) refit on the anchors
-            src = np.array([pos[a] for a, b in er.matched_pairs], float)
-            dst = np.array([spos[b] for a, b in er.matched_pairs], float)
-            R, t, s_fit, resid = place_scale_locked(src, dst)
-            if not (0.5 < s_fit < 2.0):
-                continue
-            ring = (pos @ R.T + t)[np.array(m1.outer_stone_indices)]
-            cov = _chaincov(ring)
-            pc = ring.mean(axis=0)
-            corrob = float(np.hypot(pc[0] - seat[0], pc[1] - seat[1]))
-            if not (cov == cov and cov >= M3_CHAIN_COVERAGE_ACCEPT and corrob <= M3_CORROB_TOL_M):
-                continue                                   # ER-DUAL conjunction (0-FP)
-            fp = _fp(ring)
-            if fp is None or _overlaps(fp, placed_fp):
-                continue
-            placed[sv] = {"R": R, "t": t, "s_fitted": s_fit, "ring": ring, "residuals": resid,
-                          "n_matched": len(src), "chain_cov": cov, "corrob": corrob}
-            placed_fp[sv] = fp
-            n_er += 1
-        if n_er:
-            print(f"[3d/4] edge-register recovery: +{n_er} plot(s) placed by boundary-on-traced-"
-                  f"line AND cadastre agreement (ER-dual conjunction, 0-FP)")
+    # NOTE: a seat-cropped edge-register "recovery" pass was tried and REMOVED -- cropping the
+    # traced-segment search to the seat window makes the "within 60 m of seat" corroboration
+    # trivially satisfiable, collapsing the ER-DUAL conjunction back into coverage-max ALONE, which
+    # overfits (it accepted KANDAMPALAYAM 35, an agent-verified decoy). A correct whole-village ER
+    # would keep the conjunction honest but is too slow (~1 min/plot); left out until optimized.
 
     # --- Honest first-class dispositions + the three deliverables (rule 2: scale-locked) ---
     placements = []
@@ -664,14 +618,13 @@ def main() -> None:
     surveyor = a[a.index("--surveyor") + 1] if "--surveyor" in a else None
     district = a[a.index("--district") + 1] if "--district" in a else "Erode"
     taluk = a[a.index("--taluk") + 1] if "--taluk" in a else ""
-    edge_recover = "--edge-recover" in a               # opt-in slow coverage-driven ER-dual pass
     if not surveyor or not villages:
         raise SystemExit("usage: python run_m3.py <VILLAGE> [VILLAGE ...] "
-                         "--surveyor <RAW DATA.dxf> [--district Erode] [--edge-recover]")
+                         "--surveyor <RAW DATA.dxf> [--district Erode]")
 
     all_pl, all_stones = [], []
     for v in villages:
-        placements, spos = place_village(v, surveyor, district, taluk, edge_recover=edge_recover)
+        placements, spos = place_village(v, surveyor, district, taluk)
         all_pl += placements
         if spos is not None and len(spos):
             all_stones.append(spos)
