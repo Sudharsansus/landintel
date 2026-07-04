@@ -47,8 +47,9 @@ from landintel.pipeline.m2_georef.extract_m1 import extract_m1_dxf
 from landintel.pipeline.m2_georef.extract_surveyor import extract_surveyor
 from landintel.pipeline.m2_georef.match import geometric_match
 from landintel.pipeline.m2_georef.m3_deliverables import (
-    M3Placement, M3_CORROB_TOL_M, classify, place_scale_locked,
-    write_dxf, write_overlay, write_report)
+    M3Placement, M3_CORROB_TOL_M, M3_ACCEPT_RESIDUAL_MEDIAN_M, M3_ACCEPT_RESIDUAL_MAX_M,
+    classify, place_scale_locked, write_dxf, write_overlay, write_report)
+from landintel.pipeline.m2_club.disposition_thresholds import CAD_MIN_STONES, FULL_MATCH_STONES
 from landintel.pipeline.m5_cadastral.geo_locate import _google_geocode_candidates
 
 CRS = "EPSG:32643"
@@ -193,15 +194,12 @@ def _overlaps(fp, placed):
     return False
 
 
-def main() -> None:
-    a = sys.argv[1:]
-    village = a[0]
-    surveyor = a[a.index("--surveyor") + 1] if "--surveyor" in a else None
-    district = a[a.index("--district") + 1] if "--district" in a else "Erode"
-    taluk = a[a.index("--taluk") + 1] if "--taluk" in a else ""
-    if not surveyor:
-        raise SystemExit("need --surveyor <RAW DATA.dxf>")
-
+def place_village(village, surveyor, district="Erode", taluk=""):
+    """Place ALL of ONE village's M1 FMBs onto the surveyor stone cloud by sequential verified
+    growth (the client's 'match ONE FMB, verify, commit, then move to the next'). Returns
+    ``(list[M3Placement], surveyor stone positions in the village window)``. A reusable METHOD:
+    both the per-village run and the SINGLE combined-district output call it and the caller writes
+    the deliverables -- so all villages can be clubbed onto the shared stone cloud in one DXF."""
     g = _google_geocode_candidates(f"{village}, {taluk}, {district}, Tamil Nadu, India", 1)
     if not g:
         raise SystemExit(f"Google geocode failed for {village}")
@@ -236,126 +234,106 @@ def main() -> None:
     print(f"[2/4] {len(sd.stones)} surveyor stones in the {village} window "
           f"({'seed-pinned on the cadastre block' if seeds else 'anchor-pinned'})")
 
+    from landintel.pipeline.m2_club.placement import CandidatePlacement
+    from landintel.pipeline.m2_club.relative_club import propagate_geometric
+
     placed, placed_fp = {}, {}
 
-    # --- Phase 0: cadastre-SEEDED crop (cadastre CROPS, stones SCORE -- rule-2 clean) ---
-    # For each plot, crop the surveyor stones to its own cadastre-seat neighbourhood and match
-    # the FMB ring against ONLY those local stones -- de-saturating the ~500-stone window so
-    # chance-congruent seats 700 m away cannot compete. A placement is kept only if it
-    # INDEPENDENTLY agrees with the seat (<= M3_CORROB_TOL_M): two independent sources (field
-    # stones + government cadastre) confirming each other. Stones set the coordinates; the
-    # cadastre only crops/cross-checks and never warps anything (rule 2).
-    n_seeded = 0
-    if seeds:
-        for sv, m1 in m1s.items():
-            seat = seeds.get(sv)
-            if seat is None:
-                continue
+    # ONE plot's best DIRECT stone placement: cadastre-seeded crop (de-saturated) plus a
+    # whole-window self-locate, keeping whichever has the smaller median residual. RANSAC is
+    # expensive, so this is computed ONCE per plot and cached; the sequential loop below only
+    # re-checks the cheap tiling constraint each round.
+    def _direct_place(sv, m1):
+        seat = seeds.get(sv)
+        cands = []
+        if seat is not None:
             ring0 = m1.stone_positions()[np.array(m1.outer_stone_indices)]
             prad = float(np.hypot(np.ptp(ring0[:, 0]), np.ptp(ring0[:, 1]))) * 0.6
             d = np.hypot(spos[:, 0] - seat[0], spos[:, 1] - seat[1])
             allowed = d <= (prad + SEED_CROP_MARGIN)
-            if allowed.sum() < 4:
-                continue                             # surveyor set no stones here -> not seeded
-            gm = geometric_match(m1, sd, allowed_stones=allowed)
-            if not gm.matched:
-                continue
-            pl = _place(m1, sd, gm)
-            if pl is None:
-                continue
-            pc = pl["ring"].mean(axis=0)
-            corrob = float(np.hypot(pc[0] - seat[0], pc[1] - seat[1]))
-            pl["corrob"] = corrob
-            if corrob > M3_CORROB_TOL_M:              # placement disagrees w/ seat -> not seeded
-                continue
-            fp = _fp(pl["ring"])
-            if fp is None or _overlaps(fp, placed_fp):
-                continue
-            placed[sv], placed_fp[sv] = pl, fp
-            n_seeded += 1
-        print(f"[2b/4] cadastre-seeded phase: {n_seeded}/{len(m1s)} plot(s) placed AND "
-              f"corroborated by the cadastre (2 independent sources)")
-    else:
-        print("[2b/4] no cadastre seeds available -> blind anchor+grow only")
+            if allowed.sum() >= 4:
+                gm = geometric_match(m1, sd, allowed_stones=allowed)
+                if gm.matched:
+                    p = _place(m1, sd, gm)
+                    if p is not None:
+                        cands.append(p)
+        gm = geometric_match(m1, sd)                       # whole-window self-locate
+        if gm.matched:
+            p = _place(m1, sd, gm)
+            if p is not None:
+                cands.append(p)
+        best = None
+        for p in cands:
+            if seat is not None:
+                pc = p["ring"].mean(axis=0)
+                p["corrob"] = float(np.hypot(pc[0] - seat[0], pc[1] - seat[1]))
+            med = float(np.median(p["residuals"])) if len(p["residuals"]) else float("inf")
+            if best is None or med < best[1]:
+                best = (p, med)
+        return best[0] if best else None
 
-    # --- Phase 1: anchor (no seed) ---
-    for sv, m1 in m1s.items():
-        gm = geometric_match(m1, sd)
-        n = len(m1.outer_stone_indices)
-        if (gm.matched and gm.n_matched_stones >= ANCHOR_MIN_INLIERS
-                and gm.n_matched_stones / n >= ANCHOR_MIN_FRAC
-                and gm.fingerprint_score <= ANCHOR_MAX_RESID):
-            pl = _place(m1, sd, gm)
-            if pl is None:
-                continue
-            fp = _fp(pl["ring"])
-            if fp is None or _overlaps(fp, placed_fp):
-                continue
-            placed[sv], placed_fp[sv] = pl, fp
-    print(f"[3/4] anchor phase: {len(placed)}/{len(m1s)} plots self-located")
+    direct = {sv: _direct_place(sv, m1) for sv, m1 in m1s.items()}
 
-    # --- Phase 2: grow from placed plots (seed = OUR anchored plots, not M2) ---
-    # Each unplaced plot is seated against EACH placed neighbour INDIVIDUALLY: crop the
-    # surveyor stones tightly around that one neighbour (neighbour radius + plot radius),
-    # which keeps the candidate set small so a distinctive plot cannot chance-match. Accept
-    # the first neighbour that yields a strong, non-overlapping (tiling) placement. The seed
-    # is purely M3's own placed plots -- no M2, no cadastre.
-    for _round in range(12):
-        changed = False
+    def _verified(sv, pl):
+        """Multi-source VERIFICATION of ONE placement -- the client's 'match + verify before the
+        next'. A plot is committed only when independent sources AGREE on it; accuracy (the robust
+        MEDIAN residual) is never relaxed:
+          - survey-grade median residual  AND  well-constrained pose (>= min(CAD_MIN_STONES,n)), AND
+          - EITHER the placement agrees with the plot's OWN government cadastre seat (survey# ->
+            parcel, <= M3_CORROB_TOL_M -- an independent 2nd source),
+            OR a dense clean self-match (>= min(FULL_MATCH_STONES,n) stones AND worst corner <= 3 m).
+        Tiling vs the committed set is checked by the caller. Returns (ok, score)."""
+        n = len(m1s[sv].outer_stone_indices)
+        res = pl.get("residuals", [])
+        if len(res) == 0:
+            return False, 0.0
+        med = float(np.median(res)); mx = float(np.max(res))
+        # SURVEY-GRADE at EVERY corner (median AND worst corner within the validated bounds) on a
+        # dense pose -- the accuracy bar is NEVER relaxed. A single corner beyond 3 m is FMB-vs-
+        # field noise: the plot is still correctly LOCATED (handled as a lower tier), but it is not
+        # survey-grade, so it does not earn ACCEPT.
+        if not (pl["n_matched"] >= min(FULL_MATCH_STONES, n)
+                and med <= M3_ACCEPT_RESIDUAL_MEDIAN_M
+                and mx <= M3_ACCEPT_RESIDUAL_MAX_M):
+            return False, 0.0
+        # AND independently cadastre-confirmed (2nd source). A plot with a seat MUST agree with it
+        # -- a dense self-match that disagrees is a saturated-field DECOY, not a confirmation.
+        corrob = pl.get("corrob")
+        if corrob is None or corrob > M3_CORROB_TOL_M:
+            return False, 0.0
+        score = pl["n_matched"] - med - 0.02 * corrob
+        return True, score
+
+    # --- SEQUENTIAL VERIFIED GROWTH (client's method: match ONE FMB, VERIFY, commit, next) ---
+    # No batch "place all then judge". Each round commits exactly ONE more plot -- the single
+    # best INDEPENDENTLY-VERIFIED candidate across all unplaced FMBs -- then re-evaluates tiling
+    # with it committed. Nothing is trusted until multiple sources agree on it.
+    while True:
+        best = None                                        # (sv, pl, fp, score)
         for sv, m1 in m1s.items():
             if sv in placed:
                 continue
-            ring = m1.stone_positions()[np.array(m1.outer_stone_indices)]
-            prad = float(np.hypot(np.ptp(ring[:, 0]), np.ptp(ring[:, 1]))) * 0.6 + GROW_REGION_PAD
-            n = len(m1.outer_stone_indices)
-            best = None
-            for pf in placed_fp.values():
-                if pf is None:
-                    continue
-                cx, cy = pf.centroid.x, pf.centroid.y
-                nrad = np.hypot(*(np.array(pf.bounds[2:]) - np.array(pf.bounds[:2]))) * 0.6
-                d = np.hypot(spos[:, 0] - cx, spos[:, 1] - cy)
-                allowed = d <= (nrad + prad)
-                if allowed.sum() < 4:
-                    continue
-                gm = geometric_match(m1, sd, allowed_stones=allowed)
-                if not (gm.matched and gm.n_matched_stones >= min(GROW_MIN_INLIERS, n)
-                        and gm.fingerprint_score <= GROW_MAX_RESID):
-                    continue
-                pl = _place(m1, sd, gm)
-                if pl is None:
-                    continue
-                fp = _fp(pl["ring"])
-                if fp is None or _overlaps(fp, placed_fp):
-                    continue
-                med = float(np.median(pl["residuals"])) if len(pl["residuals"]) else float("inf")
-                if best is None or med < best[2]:
-                    best = (pl, fp, med)
-            if best is not None:
-                placed[sv], placed_fp[sv] = best[0], best[1]
-                changed = True
-        if not changed:
+            pl = direct.get(sv)
+            if pl is None:
+                continue
+            fp = _fp(pl["ring"])
+            if fp is None or _overlaps(fp, placed_fp):
+                continue
+            ok, score = _verified(sv, pl)
+            if ok and (best is None or score > best[3]):
+                best = (sv, pl, fp, score)
+        if best is None:
             break
+        sv, pl, fp, _s = best
+        placed[sv], placed_fp[sv] = pl, fp                 # commit ONE verified plot, then re-loop
+    print(f"[3/4] verified growth: {len(placed)}/{len(m1s)} plots placed one-by-one "
+          f"(each survey-grade + independently verified before the next)")
 
-    # --- Phase 3: relative stone-match propagation (client's FMBS_STONES_MATCH, rule-2 rigid) ---
-    # Seat a not-yet-confident plot against a CONFIRMED survey-grade ACCEPT anchor by their SHARED
-    # FMB corner stones (>=3 coincident + tiling = 0-FP, label-free). Pure geometry on the FMB
-    # rings, surveyor/cadastre-independent: the plot inherits the anchor's georeference at the
-    # shared boundary. This is the client's own Stage-3 assembly (relative_club.propagate_geometric)
-    # reused to FIND the match, then placed RIGIDLY (scale=1) so no edge length is warped (rule 2).
-    from landintel.pipeline.m2_club.placement import CandidatePlacement
-    from landintel.pipeline.m2_club.relative_club import propagate_geometric
-
-    def _disp_of(sv, pl):
-        n = len(m1s[sv].outer_stone_indices)
-        res = pl["residuals"]
-        med = float(np.median(res)) if len(res) else float("nan")
-        mx = float(np.max(res)) if len(res) else float("nan")
-        seat = seeds.get(sv); cr = pl.get("corrob")
-        if cr is None and seat is not None:
-            pc = pl["ring"].mean(axis=0); cr = float(np.hypot(pc[0] - seat[0], pc[1] - seat[1]))
-        return classify(pl["n_matched"], n, med, mx, pl["s_fitted"], True, True, cr)[0]
-
+    # --- Relative growth (client's FMBS_STONES_MATCH), also ONE verified commit per round ---
+    # Seat a still-unplaced plot against a committed neighbour by their SHARED FMB corners
+    # (relative_club.propagate_geometric), placed RIGIDLY (scale=1, rule 2). A relative tie is
+    # trusted only when it ALSO lands at the plot's OWN cadastre seat (a THIRD source) -- the
+    # >=3-shared-corner + tiling gate alone admits chance ties 150-1100 m off (measured).
     def _anchor_cp(sv):
         pl = placed[sv]; m1 = m1s[sv]; pos = m1.stone_positions()
         adj = pos @ pl["R"].T + pl["t"]                    # scale=1 rigid, ALL stones
@@ -364,22 +342,15 @@ def main() -> None:
                                   scale=1.0)
 
     n_rel = 0
-    for _round in range(6):
-        # anchors = survey-grade ACCEPTs (dual-confirmed) + already relative-seated (can chain)
-        anchor_svs = [sv for sv in placed
-                      if placed[sv].get("relative_to") or _disp_of(sv, placed[sv]) == "ACCEPT"]
-        anchor_cps = {sv: _anchor_cp(sv) for sv in anchor_svs}
-        tile_fps = [cp.footprint() for cp in anchor_cps.values()]
-        changed = False
+    while True:
+        anchor_cps = {sv: _anchor_cp(sv) for sv in placed}
+        tile_fps = list(placed_fp.values())
+        best = None                                        # (sv, rp, fp, score)
         for sv, m1 in m1s.items():
-            if sv in anchor_cps:                           # already confident -> not a target
+            if sv in placed:
                 continue
-            # RECOVER only plots that aren't already located by their OWN stones (unplaced or
-            # NEEDS_GPS). Never supersede a solo ACCEPT/REVIEW with a (lower-corner) relative tie
-            # -- relative recovery is additive, it fills gaps, it does not overwrite real matches.
-            cur = placed.get(sv)
-            if cur is not None and not cur.get("relative_to") and _disp_of(sv, cur) in (
-                    "ACCEPT", "REVIEW"):
+            seat = seeds.get(sv)
+            if seat is None:                               # cannot verify a relative tie -> skip
                 continue
             for asv, acp in anchor_cps.items():
                 cand = propagate_geometric(m1, acp, m1s[asv], tile_fps)
@@ -388,32 +359,25 @@ def main() -> None:
                 rp = _place_relative(m1, cand, acp.corner_points())
                 if rp is None:
                     continue
-                # INDEPENDENT 0-FP gate: a relative tie must ALSO land at the plot's OWN cadastre
-                # seat (a THIRD source). Measured: the >=3-shared-corner + tiling gate alone admits
-                # chance ties that tile locally but sit 150-1100 m off their true location; requiring
-                # agreement with the independent cadastre seat rejects every one of them. No seat ->
-                # cannot verify -> not trusted (never a blind relative ACCEPT).
-                seat = seeds.get(sv)
-                if seat is None:
-                    continue
                 pc = rp["ring"].mean(axis=0)
                 cr = float(np.hypot(pc[0] - seat[0], pc[1] - seat[1]))
-                if cr > M3_CORROB_TOL_M:
+                if cr > M3_CORROB_TOL_M:                   # VERIFY vs the independent cadastre seat
                     continue
                 fp = _fp(rp["ring"])
-                if fp is None or _overlaps(fp, {a: anchor_cps[a].footprint() for a in anchor_cps}):
+                if fp is None or _overlaps(fp, placed_fp):
                     continue
-                rp["relative_to"] = asv
-                rp["corrob"] = cr
-                placed[sv], placed_fp[sv] = rp, fp
-                tile_fps.append(fp)
-                n_rel += 1; changed = True
-                break
-        if not changed:
+                score = rp["n_matched"] - 0.02 * cr
+                if best is None or score > best[3]:
+                    rp2 = dict(rp); rp2["relative_to"] = asv; rp2["corrob"] = cr
+                    best = (sv, rp2, fp, score)
+        if best is None:
             break
+        sv, rp, fp, _s = best
+        placed[sv], placed_fp[sv] = rp, fp                 # commit ONE verified relative tie
+        n_rel += 1
     if n_rel:
-        print(f"[3b/4] relative stone-match: +{n_rel} plot(s) seated by shared FMB corners with a "
-              f"confirmed neighbour (client FMBS_STONES_MATCH, rigid)")
+        print(f"[3b/4] relative stone-match: +{n_rel} plot(s) seated one-by-one by shared FMB "
+              f"corners with a confirmed neighbour (client FMBS_STONES_MATCH, cadastre-verified)")
 
     # --- Honest first-class dispositions + the three deliverables (rule 2: scale-locked) ---
     placements = []
@@ -439,59 +403,105 @@ def main() -> None:
                      f"({pl['n_matched']} shared corners, rigid); cadastre-verified "
                      f"{cr:.0f}m, FMB-fidelity extent"))
         elif pl is not None:
+            # COMMITTED by the sequential verified growth: survey-grade median AND (independent
+            # cadastre agreement OR dense clean self-match) AND it tiles -- multiple independent
+            # sources agreed BEFORE it was committed. -> ACCEPT (accuracy never relaxed).
             res = pl["residuals"]
             med = float(np.median(res)) if len(res) else float("nan")
             mx = float(np.max(res)) if len(res) else float("nan")
-            # Cadastre corroboration for ANY placed plot that has a seat (whether the seeded
-            # phase or the blind anchor+grow placed it): distance from the placed ring centroid
-            # to the independent cadastre seat. Feeds classify's 0-FP cross-check -- confirms a
-            # seat-agreeing ACCEPT, demotes a survey-grade fit that lands away from the seat.
-            seat = seeds.get(sv)
             corrob = pl.get("corrob")
-            if corrob is None and seat is not None:
-                pc = pl["ring"].mean(axis=0)
-                corrob = float(np.hypot(pc[0] - seat[0], pc[1] - seat[1]))
-            disp, note = classify(pl["n_matched"], n, med, mx, pl["s_fitted"],
-                                  tiles=True, window_has_stones=True,
-                                  cadastre_corrob_m=corrob)
+            src = ("cadastre-corroborated {:.1f}m (2 independent sources)".format(corrob)
+                   if corrob is not None and corrob <= M3_CORROB_TOL_M else "dense self-match")
             placements.append(M3Placement(
-                survey_number=sv, disposition=disp, R=pl["R"], t=pl["t"],
+                survey_number=sv, disposition="ACCEPT", R=pl["R"], t=pl["t"],
                 s_fitted=pl["s_fitted"], ring_utm=pl["ring"], n_matched=pl["n_matched"],
                 n_corners=n, median_residual_m=med, max_residual_m=mx,
-                cadastre_corrob_m=(float("nan") if corrob is None else corrob), note=note))
+                cadastre_corrob_m=(float("nan") if corrob is None else corrob),
+                note=f"n={pl['n_matched']}/{n} med={med:.2f}m max={mx:.2f}m "
+                     f"(survey-grade, verified: {src})"))
         else:
-            # Not placed: stones exist in the village window but no confident fit -> NEEDS_GPS
-            # (an operator GPS/seed disambiguates). run_m3 crops to the whole village window,
-            # so it cannot yet prove a per-plot data gap (UNMEASURED); that needs a per-plot
-            # seat and is left honestly as NEEDS_GPS rather than faked.
-            disp, note = classify(0, n, float("nan"), float("nan"), float("nan"),
-                                  tiles=True, window_has_stones=True)
-            placements.append(M3Placement(survey_number=sv, disposition=disp,
-                                          n_corners=n, note=note))
+            # NOT committed. If its best direct attempt still LANDS at its cadastre seat it is
+            # correctly located but sub-survey-grade / lost a tiling conflict -> REVIEW (geometry
+            # shown). Otherwise (decoy / no seat) -> NEEDS_GPS, no geometry drawn (never a fake).
+            pl2 = direct.get(sv)
+            corrob = pl2.get("corrob") if pl2 else None
+            if pl2 is not None and corrob is not None and corrob <= M3_CORROB_TOL_M:
+                res = pl2["residuals"]
+                med = float(np.median(res)) if len(res) else float("nan")
+                mx = float(np.max(res)) if len(res) else float("nan")
+                placements.append(M3Placement(
+                    survey_number=sv, disposition="REVIEW", R=pl2["R"], t=pl2["t"],
+                    s_fitted=pl2["s_fitted"], ring_utm=pl2["ring"], n_matched=pl2["n_matched"],
+                    n_corners=n, median_residual_m=med, max_residual_m=mx,
+                    cadastre_corrob_m=corrob,
+                    note=f"n={pl2['n_matched']}/{n} med={med:.2f}m cadastre-agrees {corrob:.0f}m "
+                         f"but sub-survey-grade / tiling conflict -> confirm"))
+            else:
+                disp, note = classify(0, n, float("nan"), float("nan"), float("nan"),
+                                      tiles=True, window_has_stones=True)
+                placements.append(M3Placement(survey_number=sv, disposition=disp,
+                                              n_corners=n, note=note))
 
-    outdir = Path(f"output/{village}/m3")
-    write_dxf(placements, outdir / "clubbed_village.dxf", crs=CRS)
-    write_overlay(placements, spos, outdir / "qa_overlay.png", village=village)
-    write_report(placements, outdir / "m3_report.json", village=village)
-
+    for p in placements:
+        p.village = village                                # tag for the combined district output
     counts: dict[str, int] = {}
     for p in placements:
         counts[p.disposition] = counts.get(p.disposition, 0) + 1
-    acc = [p.survey_number for p in placements if p.disposition == "ACCEPT"]
-    rel = [p.survey_number for p in placements if p.disposition == "ACCEPT_RELATIVE"]
-    meds = [p.median_residual_m for p in placements
-            if p.disposition == "ACCEPT" and p.median_residual_m == p.median_residual_m]
-    mr = float(np.median(meds)) if meds else 0.0
-    print(f"[4/4] M3 complete: {counts.get('ACCEPT', 0)} ACCEPT (survey-grade, dual-confirmed) "
-          f"+ {counts.get('ACCEPT_RELATIVE', 0)} ACCEPT_RELATIVE (client shared-stone match) "
-          f"= {counts.get('ACCEPT', 0) + counts.get('ACCEPT_RELATIVE', 0)}/{len(placements)} "
-          f"placed confidently | median residual {mr:.2f} m")
-    print(f"      dispositions: {counts}")
-    print(f"      ACCEPT (dual-confirmed): {sorted(acc, key=lambda s: int(s) if s.isdigit() else 0)}")
-    if rel:
-        print(f"      ACCEPT_RELATIVE (shared-stone): "
-              f"{sorted(rel, key=lambda s: int(s) if s.isdigit() else 0)}")
-    print(f"      deliverables -> {outdir}/clubbed_village.dxf, qa_overlay.png, m3_report.json")
+    print(f"[4/4] {village}: {counts.get('ACCEPT', 0)} ACCEPT (survey-grade) + "
+          f"{counts.get('ACCEPT_RELATIVE', 0)} ACCEPT_RELATIVE (shared-stone) = "
+          f"{counts.get('ACCEPT', 0) + counts.get('ACCEPT_RELATIVE', 0)}/{len(placements)} "
+          f"clubbed | {dict(counts)}")
+    return placements, spos
+
+
+def main() -> None:
+    """M3 = ONE clubbed output. Takes 1+ villages; each is placed by ``place_village`` against the
+    SAME surveyor stone cloud, and ALL placements are written to a SINGLE DXF/report/overlay (the
+    surveyor RAW DATA is one cloud spanning the district). Per-village runs stay backward-compatible.
+    Usage: python run_m3.py <VILLAGE> [VILLAGE ...] --surveyor "<RAW DATA.dxf>" [--district Erode]"""
+    a = sys.argv[1:]
+    villages = []
+    for tok in a:
+        if tok.startswith("--"):
+            break
+        villages.append(tok)
+    surveyor = a[a.index("--surveyor") + 1] if "--surveyor" in a else None
+    district = a[a.index("--district") + 1] if "--district" in a else "Erode"
+    taluk = a[a.index("--taluk") + 1] if "--taluk" in a else ""
+    if not surveyor or not villages:
+        raise SystemExit("usage: python run_m3.py <VILLAGE> [VILLAGE ...] "
+                         "--surveyor <RAW DATA.dxf> [--district Erode]")
+
+    all_pl, all_stones = [], []
+    for v in villages:
+        placements, spos = place_village(v, surveyor, district, taluk)
+        all_pl += placements
+        if spos is not None and len(spos):
+            all_stones.append(spos)
+    stones = np.vstack(all_stones) if all_stones else np.empty((0, 2))
+
+    # SINGLE M3 OUTPUT: every village's plots clubbed onto the shared surveyor stones in ONE DXF.
+    single = len(villages) == 1
+    outdir = Path(f"output/{villages[0]}/m3") if single else Path("output/M3_CLUBBED")
+    title = villages[0] if single else "+".join(villages)
+    write_dxf(all_pl, outdir / "clubbed_village.dxf", crs=CRS)
+    write_overlay(all_pl, stones, outdir / "qa_overlay.png", village=title)
+    write_report(all_pl, outdir / "m3_report.json", village=title)
+
+    counts: dict[str, int] = {}
+    for p in all_pl:
+        counts[p.disposition] = counts.get(p.disposition, 0) + 1
+    acc = sorted(f"{p.village}:{p.survey_number}" for p in all_pl if p.disposition == "ACCEPT")
+    rel = sorted(f"{p.village}:{p.survey_number}" for p in all_pl
+                 if p.disposition == "ACCEPT_RELATIVE")
+    n_ok = counts.get("ACCEPT", 0) + counts.get("ACCEPT_RELATIVE", 0)
+    print(f"\n================ M3 SINGLE CLUBBED OUTPUT: {title} ================")
+    print(f"{n_ok}/{len(all_pl)} plots clubbed onto the surveyor stone cloud "
+          f"({counts.get('ACCEPT', 0)} survey-grade + {counts.get('ACCEPT_RELATIVE', 0)} "
+          f"shared-stone), ALL cadastre-verified | dispositions {dict(counts)}")
+    print(f"  ACCEPT (survey-grade)  : {acc}")
+    print(f"  ACCEPT_RELATIVE        : {rel}")
+    print(f"  ONE DXF -> {outdir}/clubbed_village.dxf   (+ qa_overlay.png, m3_report.json)")
 
 
 if __name__ == "__main__":

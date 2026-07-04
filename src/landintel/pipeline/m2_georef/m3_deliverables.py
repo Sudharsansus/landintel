@@ -82,6 +82,7 @@ class M3Placement:
     cadastre_corrob_m: float = float("nan")   # dist placement<->cadastre seat (NaN = no seat)
     note: str = ""
     m1_file: str = ""
+    village: str = ""                          # source village (for the combined district output)
 
     def footprint(self) -> Polygon | None:
         if self.ring_utm is None or len(self.ring_utm) < 3:
@@ -182,7 +183,8 @@ def write_dxf(placements: list[M3Placement], out_path: Path, *,
             "layer": f"M3_{p.disposition}",
             "color": _LAYER_ACI.get(p.disposition, 7)})
         cx, cy = float(np.mean(p.ring_utm[:, 0])), float(np.mean(p.ring_utm[:, 1]))
-        msp.add_text(str(p.survey_number),
+        label = f"{p.village}:{p.survey_number}" if p.village else str(p.survey_number)
+        msp.add_text(label,
                      dxfattribs={"height": 3.0, "layer": f"M3_{p.disposition}"}
                      ).set_placement((cx, cy))
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -238,6 +240,7 @@ def write_report(placements: list[M3Placement], out_path: Path, *,
     for p in placements:
         counts[p.disposition] = counts.get(p.disposition, 0) + 1
         rows.append({
+            "village": p.village,
             "survey_number": p.survey_number,
             "disposition": p.disposition,
             "n_matched": p.n_matched,
