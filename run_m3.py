@@ -145,6 +145,36 @@ def _place(m1, surveyor, result):
             "residuals": residuals, "n_matched": len(src)}
 
 
+def _place_relative(m1_b, cand, anchor_corners, tol=3.0):
+    """RULE-2 rigid (scale=1) placement of a plot propagated onto a confirmed neighbour.
+
+    ``propagate_geometric`` (the client's FMBS_STONES_MATCH) finds WHICH of ``m1_b``'s FMB
+    corners coincide with the anchor's placed corners, but it applies a small umeyama scale
+    (0.85-1.18). M3 is scale-strict, so we take those shared correspondences and re-fit
+    ROTATION + TRANSLATION only (``place_scale_locked``): the FMB edge lengths are preserved
+    exactly and the plot inherits the anchor's georeference at the shared boundary. The fitted
+    scale is a diagnostic; far from 1 would be an upstream unit bug, never baked in. Returns a
+    placement dict like ``_place`` (with ``relative_to`` set by the caller), or None."""
+    pos = m1_b.stone_positions()
+    b_adj = np.asarray(cand.adjusted, float)
+    src, dst, used = [], [], set()
+    for bi in m1_b.outer_stone_indices:
+        if not (0 <= bi < len(b_adj)):
+            continue
+        d = np.hypot(anchor_corners[:, 0] - b_adj[bi][0], anchor_corners[:, 1] - b_adj[bi][1])
+        ai = int(np.argmin(d))
+        if d[ai] <= tol and ai not in used:                # same physical corner
+            src.append(pos[bi]); dst.append(anchor_corners[ai]); used.add(ai)
+    if len(src) < 3:                                       # client's >=3 shared-stone bar
+        return None
+    R, t, s_fitted, residuals = place_scale_locked(np.array(src, float), np.array(dst, float))
+    if not (0.5 < s_fitted < 2.0):
+        return None
+    ring = (pos @ R.T + t)[np.array(m1_b.outer_stone_indices)]
+    return {"R": R, "t": t, "s_fitted": s_fitted, "ring": ring,
+            "residuals": residuals, "n_matched": len(src), "relative_to": None}
+
+
 def _fp(ring):
     if ring is None or len(ring) < 3:
         return None
@@ -307,12 +337,108 @@ def main() -> None:
         if not changed:
             break
 
+    # --- Phase 3: relative stone-match propagation (client's FMBS_STONES_MATCH, rule-2 rigid) ---
+    # Seat a not-yet-confident plot against a CONFIRMED survey-grade ACCEPT anchor by their SHARED
+    # FMB corner stones (>=3 coincident + tiling = 0-FP, label-free). Pure geometry on the FMB
+    # rings, surveyor/cadastre-independent: the plot inherits the anchor's georeference at the
+    # shared boundary. This is the client's own Stage-3 assembly (relative_club.propagate_geometric)
+    # reused to FIND the match, then placed RIGIDLY (scale=1) so no edge length is warped (rule 2).
+    from landintel.pipeline.m2_club.placement import CandidatePlacement
+    from landintel.pipeline.m2_club.relative_club import propagate_geometric
+
+    def _disp_of(sv, pl):
+        n = len(m1s[sv].outer_stone_indices)
+        res = pl["residuals"]
+        med = float(np.median(res)) if len(res) else float("nan")
+        mx = float(np.max(res)) if len(res) else float("nan")
+        seat = seeds.get(sv); cr = pl.get("corrob")
+        if cr is None and seat is not None:
+            pc = pl["ring"].mean(axis=0); cr = float(np.hypot(pc[0] - seat[0], pc[1] - seat[1]))
+        return classify(pl["n_matched"], n, med, mx, pl["s_fitted"], True, True, cr)[0]
+
+    def _anchor_cp(sv):
+        pl = placed[sv]; m1 = m1s[sv]; pos = m1.stone_positions()
+        adj = pos @ pl["R"].T + pl["t"]                    # scale=1 rigid, ALL stones
+        return CandidatePlacement(method="m3_anchor", R=pl["R"], s=1.0, t=pl["t"], adjusted=adj,
+                                  corner_ring=list(m1.outer_stone_indices), passes_gate=True,
+                                  scale=1.0)
+
+    n_rel = 0
+    for _round in range(6):
+        # anchors = survey-grade ACCEPTs (dual-confirmed) + already relative-seated (can chain)
+        anchor_svs = [sv for sv in placed
+                      if placed[sv].get("relative_to") or _disp_of(sv, placed[sv]) == "ACCEPT"]
+        anchor_cps = {sv: _anchor_cp(sv) for sv in anchor_svs}
+        tile_fps = [cp.footprint() for cp in anchor_cps.values()]
+        changed = False
+        for sv, m1 in m1s.items():
+            if sv in anchor_cps:                           # already confident -> not a target
+                continue
+            # RECOVER only plots that aren't already located by their OWN stones (unplaced or
+            # NEEDS_GPS). Never supersede a solo ACCEPT/REVIEW with a (lower-corner) relative tie
+            # -- relative recovery is additive, it fills gaps, it does not overwrite real matches.
+            cur = placed.get(sv)
+            if cur is not None and not cur.get("relative_to") and _disp_of(sv, cur) in (
+                    "ACCEPT", "REVIEW"):
+                continue
+            for asv, acp in anchor_cps.items():
+                cand = propagate_geometric(m1, acp, m1s[asv], tile_fps)
+                if cand is None:
+                    continue
+                rp = _place_relative(m1, cand, acp.corner_points())
+                if rp is None:
+                    continue
+                # INDEPENDENT 0-FP gate: a relative tie must ALSO land at the plot's OWN cadastre
+                # seat (a THIRD source). Measured: the >=3-shared-corner + tiling gate alone admits
+                # chance ties that tile locally but sit 150-1100 m off their true location; requiring
+                # agreement with the independent cadastre seat rejects every one of them. No seat ->
+                # cannot verify -> not trusted (never a blind relative ACCEPT).
+                seat = seeds.get(sv)
+                if seat is None:
+                    continue
+                pc = rp["ring"].mean(axis=0)
+                cr = float(np.hypot(pc[0] - seat[0], pc[1] - seat[1]))
+                if cr > M3_CORROB_TOL_M:
+                    continue
+                fp = _fp(rp["ring"])
+                if fp is None or _overlaps(fp, {a: anchor_cps[a].footprint() for a in anchor_cps}):
+                    continue
+                rp["relative_to"] = asv
+                rp["corrob"] = cr
+                placed[sv], placed_fp[sv] = rp, fp
+                tile_fps.append(fp)
+                n_rel += 1; changed = True
+                break
+        if not changed:
+            break
+    if n_rel:
+        print(f"[3b/4] relative stone-match: +{n_rel} plot(s) seated by shared FMB corners with a "
+              f"confirmed neighbour (client FMBS_STONES_MATCH, rigid)")
+
     # --- Honest first-class dispositions + the three deliverables (rule 2: scale-locked) ---
     placements = []
     for sv, m1 in m1s.items():
         n = len(m1.outer_stone_indices)
         pl = placed.get(sv)
-        if pl is not None:
+        if pl is not None and pl.get("relative_to"):
+            # Placed by the client's shared-stone match to a CONFIRMED neighbour. It already
+            # passed the client's own 0-FP bar (>=3 coincident FMB corners + tiling), so it is
+            # judged on THAT provenance, not re-gated by the solo-stone residual bar. A DISTINCT
+            # tier: confidently LOCATED via a confirmed neighbour, with FMB-fidelity extent at
+            # the non-shared corners -- never conflated with the dual-confirmed survey-grade set.
+            res = pl["residuals"]
+            med = float(np.median(res)) if len(res) else float("nan")
+            mx = float(np.max(res)) if len(res) else float("nan")
+            cr = pl.get("corrob", float("nan"))
+            placements.append(M3Placement(
+                survey_number=sv, disposition="ACCEPT_RELATIVE", R=pl["R"], t=pl["t"],
+                s_fitted=pl["s_fitted"], ring_utm=pl["ring"], n_matched=pl["n_matched"],
+                n_corners=n, median_residual_m=med, max_residual_m=mx,
+                cadastre_corrob_m=(float("nan") if cr is None else cr),
+                note=f"relative stone-match to confirmed {pl['relative_to']} "
+                     f"({pl['n_matched']} shared corners, rigid); cadastre-verified "
+                     f"{cr:.0f}m, FMB-fidelity extent"))
+        elif pl is not None:
             res = pl["residuals"]
             med = float(np.median(res)) if len(res) else float("nan")
             mx = float(np.max(res)) if len(res) else float("nan")
@@ -352,13 +478,19 @@ def main() -> None:
     for p in placements:
         counts[p.disposition] = counts.get(p.disposition, 0) + 1
     acc = [p.survey_number for p in placements if p.disposition == "ACCEPT"]
+    rel = [p.survey_number for p in placements if p.disposition == "ACCEPT_RELATIVE"]
     meds = [p.median_residual_m for p in placements
             if p.disposition == "ACCEPT" and p.median_residual_m == p.median_residual_m]
     mr = float(np.median(meds)) if meds else 0.0
-    print(f"[4/4] M3 complete: {counts.get('ACCEPT', 0)}/{len(placements)} ACCEPT "
-          f"(survey-grade, scale-locked s=1) | median residual {mr:.2f} m")
+    print(f"[4/4] M3 complete: {counts.get('ACCEPT', 0)} ACCEPT (survey-grade, dual-confirmed) "
+          f"+ {counts.get('ACCEPT_RELATIVE', 0)} ACCEPT_RELATIVE (client shared-stone match) "
+          f"= {counts.get('ACCEPT', 0) + counts.get('ACCEPT_RELATIVE', 0)}/{len(placements)} "
+          f"placed confidently | median residual {mr:.2f} m")
     print(f"      dispositions: {counts}")
-    print(f"      ACCEPT surveys: {sorted(acc, key=lambda s: int(s) if s.isdigit() else 0)}")
+    print(f"      ACCEPT (dual-confirmed): {sorted(acc, key=lambda s: int(s) if s.isdigit() else 0)}")
+    if rel:
+        print(f"      ACCEPT_RELATIVE (shared-stone): "
+              f"{sorted(rel, key=lambda s: int(s) if s.isdigit() else 0)}")
     print(f"      deliverables -> {outdir}/clubbed_village.dxf, qa_overlay.png, m3_report.json")
 
 

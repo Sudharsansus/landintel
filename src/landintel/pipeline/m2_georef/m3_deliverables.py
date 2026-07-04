@@ -160,8 +160,8 @@ def classify(n_matched: int, n_corners: int, median_resid: float, max_resid: flo
 
 
 # ----------------------------------------------------------------- deliverables ----
-_LAYER_ACI = {"ACCEPT": 3, "REVIEW": 30, "NEEDS_GPS": 1}     # green / orange / red
-_DISP_COLOR = {"ACCEPT": "#2ca02c", "REVIEW": "#ff7f0e",
+_LAYER_ACI = {"ACCEPT": 3, "ACCEPT_RELATIVE": 4, "REVIEW": 30, "NEEDS_GPS": 1}  # grn/cyan/org/red
+_DISP_COLOR = {"ACCEPT": "#2ca02c", "ACCEPT_RELATIVE": "#17becf", "REVIEW": "#ff7f0e",
                "NEEDS_GPS": "#d62728", "UNMEASURED": "#7f7f7f"}
 
 
