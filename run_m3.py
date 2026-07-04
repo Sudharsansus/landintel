@@ -47,9 +47,11 @@ from shapely.geometry import Polygon
 from landintel.pipeline.m2_georef.extract_m1 import extract_m1_dxf
 from landintel.pipeline.m2_georef.extract_surveyor import extract_surveyor
 from landintel.pipeline.m2_georef.match import geometric_match
+from landintel.pipeline.m2_georef.verify import build_traced_buffer, chain_coverage
 from landintel.pipeline.m2_georef.m3_deliverables import (
     M3Placement, M3_CORROB_TOL_M, M3_ACCEPT_RESIDUAL_MEDIAN_M, M3_ACCEPT_RESIDUAL_MAX_M,
-    classify, place_scale_locked, write_dxf, write_overlay, write_report)
+    M3_CHAIN_COVERAGE_ACCEPT, classify, place_scale_locked,
+    write_dxf, write_overlay, write_report)
 from landintel.pipeline.m2_club.disposition_thresholds import CAD_MIN_STONES, FULL_MATCH_STONES
 from landintel.pipeline.m5_cadastral.geo_locate import _google_geocode_candidates
 
@@ -235,6 +237,18 @@ def place_village(village, surveyor, district="Erode", taluk=""):
     from landintel.agents.stone_reader import StoneReaderAgent
     sd, sr = StoneReaderAgent().read(surveyor, bbox=bbox, crs=CRS)
     spos = sd.stone_positions
+    # Traced-boundary buffer (SITE DATA LINE): the INGUR ground-truth FP signal. Present only when
+    # the surveyor file carries traced lines (RAW DATA WITH LINES.dxf); None for a pure stone cloud
+    # -> chain_coverage returns 0 and the pipeline falls back to the cadastre gate (no regression).
+    traced_buf = build_traced_buffer([p.raw_points for p in sd.polylines], tol=3.0)
+
+    def _chaincov(ring) -> float:
+        """Fraction of a placed ring's boundary lying on the surveyor's traced SITE DATA LINE."""
+        if traced_buf is None or ring is None or len(ring) < 3:
+            return float("nan")
+        pts = [(float(x), float(y)) for x, y in ring]
+        segs = [(pts[i], pts[i + 1]) for i in range(len(pts) - 1)] + [(pts[-1], pts[0])]
+        return chain_coverage(segs, prepared=traced_buf)
     sr_fail = [c for c in sr.checks if c.severity.value == "fail"]
     sr_warn = [c for c in sr.checks if c.severity.value == "warn"]
     status = "verified" if not (sr_fail or sr_warn) else (
@@ -279,38 +293,41 @@ def place_village(village, surveyor, district="Erode", taluk=""):
             med = float(np.median(p["residuals"])) if len(p["residuals"]) else float("inf")
             if best is None or med < best[1]:
                 best = (p, med)
-        return best[0] if best else None
+        if best is None:
+            return None
+        best[0]["chain_cov"] = _chaincov(best[0]["ring"])   # fraction on the traced survey lines
+        return best[0]
 
     direct = {sv: _direct_place(sv, m1) for sv, m1 in m1s.items()}
 
     def _verified(sv, pl):
-        """Multi-source VERIFICATION of ONE placement -- the client's 'match + verify before the
-        next'. A plot is committed only when independent sources AGREE on it; accuracy (the robust
-        MEDIAN residual) is never relaxed:
-          - survey-grade median residual  AND  well-constrained pose (>= min(CAD_MIN_STONES,n)), AND
-          - EITHER the placement agrees with the plot's OWN government cadastre seat (survey# ->
-            parcel, <= M3_CORROB_TOL_M -- an independent 2nd source),
-            OR a dense clean self-match (>= min(FULL_MATCH_STONES,n) stones AND worst corner <= 3 m).
+        """Commit a placement only when an independent GROUND-TRUTH source confirms it. Two paths,
+        both 0-FP; the accuracy bar (robust MEDIAN residual) is never relaxed:
+          A. SURVEY-BOUNDARY CONFIRMED (the INGUR gate): the FMB boundary lies on the surveyor's
+             actually-traced SITE DATA LINE (chain_coverage >= M3_CHAIN_COVERAGE_ACCEPT) on a
+             well-constrained pose (>= min(6,n)) with a real match (median < 3 m). This is DIRECT
+             ground truth -- the surveyor traced this exact boundary here -- so no cadastre proxy
+             is needed, and a single FMB-noisy corner does not disqualify a boundary that follows
+             the surveyed line.
+          B. CADASTRE-CONFIRMED (fallback when the surveyor did NOT trace this boundary): survey-
+             grade at EVERY corner (median<=2 AND max<=3) on a dense pose (>= min(5,n)) AND agrees
+             with the plot's own government cadastre seat (<= M3_CORROB_TOL_M).
         Tiling vs the committed set is checked by the caller. Returns (ok, score)."""
         n = len(m1s[sv].outer_stone_indices)
         res = pl.get("residuals", [])
         if len(res) == 0:
             return False, 0.0
         med = float(np.median(res)); mx = float(np.max(res))
-        # SURVEY-GRADE at EVERY corner (median AND worst corner within the validated bounds) on a
-        # dense pose -- the accuracy bar is NEVER relaxed. A single corner beyond 3 m is FMB-vs-
-        # field noise: the plot is still correctly LOCATED (handled as a lower tier), but it is not
-        # survey-grade, so it does not earn ACCEPT.
-        if not (pl["n_matched"] >= min(FULL_MATCH_STONES, n)
-                and med <= M3_ACCEPT_RESIDUAL_MEDIAN_M
-                and mx <= M3_ACCEPT_RESIDUAL_MAX_M):
-            return False, 0.0
-        # AND independently cadastre-confirmed (2nd source). A plot with a seat MUST agree with it
-        # -- a dense self-match that disagrees is a saturated-field DECOY, not a confirmation.
+        cov = float(pl.get("chain_cov", float("nan")))
         corrob = pl.get("corrob")
-        if corrob is None or corrob > M3_CORROB_TOL_M:
+        chain_ok = (cov == cov and cov >= M3_CHAIN_COVERAGE_ACCEPT
+                    and pl["n_matched"] >= min(6, n) and med < M3_ACCEPT_RESIDUAL_MAX_M)
+        cad_ok = (pl["n_matched"] >= min(FULL_MATCH_STONES, n)
+                  and med <= M3_ACCEPT_RESIDUAL_MEDIAN_M and mx <= M3_ACCEPT_RESIDUAL_MAX_M
+                  and corrob is not None and corrob <= M3_CORROB_TOL_M)
+        if not (chain_ok or cad_ok):
             return False, 0.0
-        score = pl["n_matched"] - med - 0.02 * corrob
+        score = pl["n_matched"] - med + (2.0 * cov if cov == cov else 0.0)
         return True, score
 
     # --- SEQUENTIAL VERIFIED GROWTH (client's method: match ONE FMB, VERIFY, commit, next) ---
@@ -378,6 +395,7 @@ def place_village(village, surveyor, district="Erode", taluk=""):
                 score = rp["n_matched"] - 0.02 * cr
                 if best is None or score > best[3]:
                     rp2 = dict(rp); rp2["relative_to"] = asv; rp2["corrob"] = cr
+                    rp2["chain_cov"] = _chaincov(rp2["ring"])
                     best = (sv, rp2, fp, score)
         if best is None:
             break
@@ -403,31 +421,39 @@ def place_village(village, surveyor, district="Erode", taluk=""):
             med = float(np.median(res)) if len(res) else float("nan")
             mx = float(np.max(res)) if len(res) else float("nan")
             cr = pl.get("corrob", float("nan"))
+            cov = float(pl.get("chain_cov", float("nan")))
+            cov_s = f"; {cov * 100:.0f}% on surveyed lines" if cov == cov else ""
             placements.append(M3Placement(
                 survey_number=sv, disposition="ACCEPT_RELATIVE", R=pl["R"], t=pl["t"],
                 s_fitted=pl["s_fitted"], ring_utm=pl["ring"], n_matched=pl["n_matched"],
                 n_corners=n, median_residual_m=med, max_residual_m=mx,
-                cadastre_corrob_m=(float("nan") if cr is None else cr),
+                chain_coverage=cov, cadastre_corrob_m=(float("nan") if cr is None else cr),
                 note=f"relative stone-match to confirmed {pl['relative_to']} "
                      f"({pl['n_matched']} shared corners, rigid); cadastre-verified "
-                     f"{cr:.0f}m, FMB-fidelity extent"))
+                     f"{cr:.0f}m{cov_s}, FMB-fidelity extent"))
         elif pl is not None:
-            # COMMITTED by the sequential verified growth: survey-grade median AND (independent
-            # cadastre agreement OR dense clean self-match) AND it tiles -- multiple independent
-            # sources agreed BEFORE it was committed. -> ACCEPT (accuracy never relaxed).
+            # COMMITTED by the sequential verified growth. Two 0-FP confirmation paths (accuracy
+            # never relaxed): its boundary lies on the surveyor's TRACED lines (survey-boundary
+            # confirmed, the INGUR ground-truth gate), OR survey-grade every corner + cadastre
+            # agreement. Multiple independent sources agreed BEFORE it was committed -> ACCEPT.
             res = pl["residuals"]
             med = float(np.median(res)) if len(res) else float("nan")
             mx = float(np.max(res)) if len(res) else float("nan")
             corrob = pl.get("corrob")
-            src = ("cadastre-corroborated {:.1f}m (2 independent sources)".format(corrob)
-                   if corrob is not None and corrob <= M3_CORROB_TOL_M else "dense self-match")
+            cov = float(pl.get("chain_cov", float("nan")))
+            if cov == cov and cov >= M3_CHAIN_COVERAGE_ACCEPT:
+                src = f"survey-boundary confirmed ({cov * 100:.0f}% on the surveyor's traced lines)"
+            elif corrob is not None and corrob <= M3_CORROB_TOL_M:
+                src = f"cadastre-corroborated {corrob:.1f}m (2 independent sources)"
+            else:
+                src = "dense self-match"
             placements.append(M3Placement(
                 survey_number=sv, disposition="ACCEPT", R=pl["R"], t=pl["t"],
                 s_fitted=pl["s_fitted"], ring_utm=pl["ring"], n_matched=pl["n_matched"],
-                n_corners=n, median_residual_m=med, max_residual_m=mx,
+                n_corners=n, median_residual_m=med, max_residual_m=mx, chain_coverage=cov,
                 cadastre_corrob_m=(float("nan") if corrob is None else corrob),
-                note=f"n={pl['n_matched']}/{n} med={med:.2f}m max={mx:.2f}m "
-                     f"(survey-grade, verified: {src})"))
+                note=f"n={pl['n_matched']}/{n} med={med:.2f}m max={mx:.2f}m (survey-grade, "
+                     f"verified: {src})"))
         else:
             # NOT committed. If its best direct attempt still LANDS at its cadastre seat it is
             # correctly located but sub-survey-grade / lost a tiling conflict -> REVIEW (geometry
@@ -438,13 +464,15 @@ def place_village(village, surveyor, district="Erode", taluk=""):
                 res = pl2["residuals"]
                 med = float(np.median(res)) if len(res) else float("nan")
                 mx = float(np.max(res)) if len(res) else float("nan")
+                cov = float(pl2.get("chain_cov", float("nan")))
+                cov_s = f", {cov * 100:.0f}% on surveyed lines" if cov == cov else ""
                 placements.append(M3Placement(
                     survey_number=sv, disposition="REVIEW", R=pl2["R"], t=pl2["t"],
                     s_fitted=pl2["s_fitted"], ring_utm=pl2["ring"], n_matched=pl2["n_matched"],
-                    n_corners=n, median_residual_m=med, max_residual_m=mx,
+                    n_corners=n, median_residual_m=med, max_residual_m=mx, chain_coverage=cov,
                     cadastre_corrob_m=corrob,
-                    note=f"n={pl2['n_matched']}/{n} med={med:.2f}m cadastre-agrees {corrob:.0f}m "
-                         f"but sub-survey-grade / tiling conflict -> confirm"))
+                    note=f"n={pl2['n_matched']}/{n} med={med:.2f}m cadastre-agrees {corrob:.0f}m"
+                         f"{cov_s} but sub-survey-grade / tiling conflict -> confirm"))
             else:
                 disp, note = classify(0, n, float("nan"), float("nan"), float("nan"),
                                       tiles=True, window_has_stones=True)

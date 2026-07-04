@@ -62,6 +62,13 @@ M3_SCALE_HI: float = 2.0
 # sits in a ~12x gap, NOT knife-edge / not overfit. The cadastre NEVER sets a coordinate
 # (rule 2, crop-only): a wrong seat can only withhold trust, never grant it.
 M3_CORROB_TOL_M: float = 60.0
+# Chain-coverage survey-confirmation gate (INGUR-validated): fraction of a placed plot's boundary
+# lying within 3 m of the surveyor's actually-traced SITE DATA LINE. On INGUR it cleanly separated
+# true matches (58-100%) from chance (12-43%); 0.50 sits in that gap. When the surveyor file
+# carries traced lines, a plot whose FMB boundary lies on them IS survey-grade correct regardless
+# of a single FMB-noisy corner -- this is the DIRECT ground-truth boundary signal, stronger than
+# the cadastre-seat proxy. NOT per-village: it is the same 0.50 the validated INGUR gate used.
+M3_CHAIN_COVERAGE_ACCEPT: float = 0.50
 
 _CONFIDENT = ("ACCEPT",)
 
@@ -79,6 +86,7 @@ class M3Placement:
     n_corners: int = 0
     median_residual_m: float = float("nan")
     max_residual_m: float = float("nan")
+    chain_coverage: float = float("nan")      # fraction of boundary on the surveyor's traced lines
     cadastre_corrob_m: float = float("nan")   # dist placement<->cadastre seat (NaN = no seat)
     note: str = ""
     m1_file: str = ""
@@ -261,6 +269,8 @@ def write_report(placements: list[M3Placement], out_path: Path, *,
                                   else round(p.median_residual_m, 3)),
             "max_residual_m": (None if p.max_residual_m != p.max_residual_m
                                else round(p.max_residual_m, 3)),
+            "chain_coverage": (None if p.chain_coverage != p.chain_coverage
+                               else round(p.chain_coverage, 3)),
             "s_fitted": (None if p.s_fitted != p.s_fitted else round(p.s_fitted, 4)),
             "scale_locked_to": 1.0,
             "cadastre_corrob_m": (None if p.cadastre_corrob_m != p.cadastre_corrob_m
