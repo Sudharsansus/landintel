@@ -51,7 +51,7 @@ from landintel.pipeline.m2_georef.verify import build_traced_buffer, chain_cover
 from landintel.pipeline.m2_georef.m3_deliverables import (
     M3Placement, M3_CORROB_TOL_M, M3_ACCEPT_RESIDUAL_MEDIAN_M, M3_ACCEPT_RESIDUAL_MAX_M,
     M3_CHAIN_COVERAGE_ACCEPT, classify, place_scale_locked,
-    write_dxf, write_overlay, write_report)
+    write_dxf, write_clubbed_fmbs, write_overlay, write_report)
 from landintel.pipeline.m2_club.disposition_thresholds import CAD_MIN_STONES, FULL_MATCH_STONES
 from landintel.pipeline.m5_cadastral.geo_locate import _google_geocode_candidates
 
@@ -210,11 +210,13 @@ def place_village(village, surveyor, district="Erode", taluk=""):
     print(f"[1/4] Google anchor {village} @ ({g[0][0]:.5f},{g[0][1]:.5f})")
 
     m1s = {}
+    m1path: dict[str, str] = {}
     m1_paths = sorted(str(p) for p in Path(f"output/{village}/m1").glob("*.dxf"))
     for p in m1_paths:
         m1 = extract_m1_dxf(p)
         if len(m1.outer_stone_indices) >= 3:
             m1s[str(m1.survey_number)] = m1
+            m1path[str(m1.survey_number)] = p
 
     # --- Cadastre seeds FIRST (surveyor-independent): per-survey parcel positions from the
     # shared M2 club algorithm on an independently-built TNGIS source (never M2's output). ---
@@ -485,6 +487,7 @@ def place_village(village, surveyor, district="Erode", taluk=""):
 
     for p in placements:
         p.village = village                                # tag for the combined district output
+        p.m1_file = m1path.get(p.survey_number, "")        # so the full FMB can be clubbed
     counts: dict[str, int] = {}
     for p in placements:
         counts[p.disposition] = counts.get(p.disposition, 0) + 1
@@ -609,7 +612,10 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001
         print(f"[worklist] worklist skipped ({exc})")
 
-    write_dxf(all_pl, outdir / "clubbed_village.dxf", crs=CRS)
+    # THE clubbed deliverable: the FULL FMBs (all layers, rigidly placed on the exact stones)
+    # merged over the surveyor's raw data (stones + traced lines) -- not just boundary rings.
+    write_clubbed_fmbs(all_pl, surveyor, outdir / "clubbed_village.dxf", crs=CRS)
+    write_dxf(all_pl, outdir / "clubbed_outlines.dxf", crs=CRS)      # lightweight ring-only view
     write_overlay(all_pl, stones, outdir / "qa_overlay.png", village=title)
     write_report(all_pl, outdir / "m3_report.json", village=title)
 

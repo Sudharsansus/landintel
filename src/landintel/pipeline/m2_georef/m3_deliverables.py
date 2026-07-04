@@ -212,6 +212,52 @@ def write_dxf(placements: list[M3Placement], out_path: Path, *,
     return out_path
 
 
+_CLUBBED_DISPOSITIONS = ("ACCEPT", "ACCEPT_SEEDED", "ACCEPT_RELATIVE")
+
+
+def write_clubbed_fmbs(placements: list[M3Placement], surveyor_path, out_path: Path, *,
+                       crs: str = "EPSG:32643",
+                       dispositions: tuple[str, ...] = _CLUBBED_DISPOSITIONS) -> Path:
+    """The REAL M3 deliverable: club the FULL FMBs (every layer -- boundary + internal/
+    subdivision lines + stones + dimensions + survey number), each RIGIDLY placed (scale=1) on
+    the EXACT surveyor stones, into ONE DXF over the surveyor's raw data (its stones + traced SITE
+    DATA LINEs as the base canvas). Not boundary rings -- the complete matched FMBs sitting on the
+    field survey. Reuses the shared output_dxf primitives (write_georef_dxf per plot ->
+    build_combined_dxf into the surveyor base). Only confidently-placed plots are clubbed."""
+    import shutil
+    import tempfile
+
+    from .extract_m1 import extract_m1_dxf
+    from .output_dxf import build_combined_dxf, write_georef_dxf
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix="m3club_"))
+    staged: list[Path] = []
+    try:
+        for p in placements:
+            if p.disposition not in dispositions or p.R is None or p.t is None or not p.m1_file:
+                continue
+            try:
+                m1 = extract_m1_dxf(p.m1_file)
+                orig = m1.stone_positions()
+                R = np.asarray(p.R, float); t = np.asarray(p.t, float)
+                adjusted = orig @ R.T + t                        # scale=1 rigid (rule 2)
+                label_idx: dict[str, int] = {}
+                for st in m1.stones:
+                    label_idx.setdefault(str(st.label), st.index)
+                sp = tmp / f"{p.village}_{p.survey_number}.dxf"
+                write_georef_dxf(p.m1_file, sp, adjusted, orig, label_idx, R, 1.0, t,
+                                 crs=crs, corner_ring=list(m1.outer_stone_indices))
+                staged.append(sp)
+            except Exception as exc:  # noqa: BLE001 - one bad plot must not lose the whole club
+                _log.warning("club FMB %s:%s failed: %s", p.village, p.survey_number, exc)
+        build_combined_dxf(surveyor_path, staged, out_path, crs=crs)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return out_path
+
+
 def write_overlay(placements: list[M3Placement], stones_xy: np.ndarray,
                   out_path: Path, *, village: str = "") -> Path:
     """One QA PNG: the surveyor stone cloud (grey dots) with each placed plot coloured
