@@ -17,6 +17,7 @@ closed plot is ACCEPT_SEEDED (distinct from the auto ACCEPT / ACCEPT_RELATIVE ti
 """
 from __future__ import annotations
 
+import csv
 import json
 import logging
 from pathlib import Path
@@ -104,6 +105,37 @@ def _apply_seeds(placements, seeds, m1_by_survey) -> list[str]:
         p.note = note
         closed.append(_sid(p))
     return closed
+
+
+def write_field_worklist(workdir):
+    """Turn input_requests.json (the agent layer's path-to-100% worklist) into a FILLABLE field
+    CSV the survey team prints and completes. One row per plot needing input, most-impactful first;
+    the blank columns map directly back to operator_confirms.json / operator_seeds.json so the
+    loop-closer can ingest the answers. Returns the CSV path, or None if there is no worklist."""
+    workdir = Path(workdir)
+    src = workdir / "input_requests.json"
+    if not src.exists():
+        return None
+    try:
+        reqs = json.loads(src.read_text()).get("requests", [])
+    except Exception:  # noqa: BLE001
+        return None
+    out = workdir / "field_worklist.csv"
+    with open(out, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["priority", "plot(village:survey)", "needs", "reason",
+                    "known_x_utm", "known_y_utm", "CONFIRM(yes/no)",
+                    "cornerA_label", "cornerA_x_utm", "cornerA_y_utm",
+                    "cornerB_label", "cornerB_x_utm", "cornerB_y_utm"])
+        for i, r in enumerate(reqs, 1):
+            it = r.get("input_type", "")
+            known = r.get("known_utm") or [None, None]
+            needs = ("CONFIRM (1 human yes/no)" if it == "confirm_placement"
+                     else "2 GPS corner points" if it == "two_corner_seed" else it)
+            w.writerow([i, r.get("survey_number", ""), needs, (r.get("reason", "") or "")[:90],
+                        known[0] if known else "", known[1] if known else "",
+                        "", "", "", "", "", "", ""])
+    return out
 
 
 def apply_operator_inputs(placements, m1_by_survey, workdir) -> dict:

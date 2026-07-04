@@ -241,6 +241,10 @@ def place_village(village, surveyor, district="Erode", taluk=""):
     # the surveyor file carries traced lines (RAW DATA WITH LINES.dxf); None for a pure stone cloud
     # -> chain_coverage returns 0 and the pipeline falls back to the cadastre gate (no regression).
     traced_buf = build_traced_buffer([p.raw_points for p in sd.polylines], tol=3.0)
+    if traced_buf is None:
+        print(f"      [!] {village}: surveyor file has NO traced SITE DATA LINE boundaries -- "
+              f"survey-boundary confirmation is OFF (falling back to the cadastre gate). "
+              f"Use the 'WITH LINES' surveyor file for full survey-grade recovery.")
 
     def _chaincov(ring) -> float:
         """Fraction of a placed ring's boundary lying on the surveyor's traced SITE DATA LINE."""
@@ -594,6 +598,16 @@ def main() -> None:
               f"{summ['n_requests']} plot(s) need input to reach 100% -> input_requests.json")
     except Exception as exc:  # noqa: BLE001 - the agent layer must never break the deliverable
         print(f"[agents] agent layer skipped ({exc})")
+
+    # Fillable field worklist: the path-to-100% requests as a CSV the survey team completes; the
+    # blank columns map back to operator_confirms.json / operator_seeds.json for the loop-closer.
+    try:
+        from landintel.pipeline.m2_georef.m3_operator import write_field_worklist
+        wl = write_field_worklist(outdir)
+        if wl:
+            print(f"[worklist] fillable field worklist -> {wl}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[worklist] worklist skipped ({exc})")
 
     write_dxf(all_pl, outdir / "clubbed_village.dxf", crs=CRS)
     write_overlay(all_pl, stones, outdir / "qa_overlay.png", village=title)
