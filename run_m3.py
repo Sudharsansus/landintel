@@ -19,6 +19,7 @@ Usage:  python run_m3.py <VILLAGE> --surveyor "<RAW DATA.dxf>" [--district Erode
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -492,6 +493,28 @@ def main() -> None:
     outdir.mkdir(parents=True, exist_ok=True)
     title = "+".join(villages)
 
+    # OPERATOR LOOP-CLOSER: turn the InputRequest worklist ANSWERS into closed plots (the last
+    # mile of "100% is a process"). If the operator has dropped operator_confirms.json /
+    # operator_seeds.json into output/M3_CLUBBED (their answers to input_requests.json), close
+    # those plots to ACCEPT_SEEDED -- FP-safe (human supplies identity; rigid s=1 seed / a confirm
+    # of an already-LOCATED plot). Absent files -> no-op. Runs BEFORE the agents so the worklist
+    # they emit reflects what is now closed.
+    m1_by_survey: dict[str, str] = {}
+    for v in villages:
+        for mp in Path(f"output/{v}/m1").glob("*.dxf"):
+            nums = re.findall(r"\d+", mp.stem)
+            if nums:
+                m1_by_survey[nums[-1]] = str(mp)
+                m1_by_survey[f"{v}:{nums[-1]}"] = str(mp)
+    try:
+        from landintel.pipeline.m2_georef.m3_operator import apply_operator_inputs
+        closed = apply_operator_inputs(all_pl, m1_by_survey, outdir)
+        if closed["confirmed"] or closed["seeded"]:
+            print(f"[operator] closed {len(closed['confirmed'])} confirmed + "
+                  f"{len(closed['seeded'])} seeded -> ACCEPT_SEEDED (human-supplied identity, 0-FP)")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[operator] loop-closer skipped ({exc})")
+
     # WAKE THE AGENT LAYER (M3 was bypassing the orchestrator -- "sleeping agents"). Runs the
     # SAME self-verifying pipeline M2 uses: VerificationAgent (FP invariants -> shippable) +
     # GuardAgent (180-deg anagram trap) + InputRequestAgent (the path-to-100% worklist: the ONE
@@ -518,11 +541,13 @@ def main() -> None:
     acc = sorted(f"{p.village}:{p.survey_number}" for p in all_pl if p.disposition == "ACCEPT")
     rel = sorted(f"{p.village}:{p.survey_number}" for p in all_pl
                  if p.disposition == "ACCEPT_RELATIVE")
-    n_ok = counts.get("ACCEPT", 0) + counts.get("ACCEPT_RELATIVE", 0)
+    n_ok = (counts.get("ACCEPT", 0) + counts.get("ACCEPT_RELATIVE", 0)
+            + counts.get("ACCEPT_SEEDED", 0))
     print(f"\n================ M3 SINGLE CLUBBED OUTPUT: {title} ================")
     print(f"{n_ok}/{len(all_pl)} plots clubbed onto the surveyor stone cloud "
           f"({counts.get('ACCEPT', 0)} survey-grade + {counts.get('ACCEPT_RELATIVE', 0)} "
-          f"shared-stone), ALL cadastre-verified | dispositions {dict(counts)}")
+          f"shared-stone + {counts.get('ACCEPT_SEEDED', 0)} operator-seeded) | "
+          f"dispositions {dict(counts)}")
     print(f"  ACCEPT (survey-grade)  : {acc}")
     print(f"  ACCEPT_RELATIVE        : {rel}")
     print(f"  ONE DXF -> {outdir}/clubbed_village.dxf   (+ qa_overlay.png, m3_report.json)")

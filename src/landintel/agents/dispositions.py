@@ -216,7 +216,8 @@ def _georef_footprint(output_file: str):
 # client's shared-stone tie, cadastre-verified) is a CONFIDENT placement, mapped to
 # ACCEPT_SEEDED (identity supplied by a confirmed neighbour, like a seed). NEEDS_GPS/UNMEASURED
 # -> NO_COVERAGE so the InputRequest agent emits the "2 corner GPS points" ask for each.
-_M3_STATE = {"ACCEPT": "ACCEPT", "ACCEPT_RELATIVE": "ACCEPT_SEEDED", "REVIEW": "REVIEW",
+_M3_STATE = {"ACCEPT": "ACCEPT", "ACCEPT_SEEDED": "ACCEPT_SEEDED",
+             "ACCEPT_RELATIVE": "ACCEPT_SEEDED", "REVIEW": "REVIEW",
              "NEEDS_GPS": "NO_COVERAGE", "UNMEASURED": "NO_COVERAGE"}
 
 
